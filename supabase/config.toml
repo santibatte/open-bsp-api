@@ -91,3 +91,11 @@ entrypoint = "./functions/mcp/index.ts"
 verify_jwt = false
 import_map = "./functions/deno.json"
 entrypoint = "./functions/storage-gc/index.ts"
+
+# Vampiresa Meli-specific: reports qualified leads (turno agendado) to Meta's
+# Conversions API. Called by our own systems, not by Meta — see the header
+# comment in meta-conversions-api/index.ts.
+[functions.meta-conversions-api]
+verify_jwt = false
+import_map = "./functions/deno.json"
+entrypoint = "./functions/meta-conversions-api/index.ts"

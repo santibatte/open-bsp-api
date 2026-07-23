@@ -180,8 +180,8 @@ Deno.serve(async (req) => {
 
   if (
     conv.service !== "local" &&
-    org.extra.authorized_contacts_only
-    // TODO: && !contact?.extra?.allowed
+    org.extra.authorized_contacts_only &&
+    !contact?.extra?.allowed
   ) {
     log.info(
       `Conversation ${conv.id} does not correspond to an authorized contact. Skipping response.`,
