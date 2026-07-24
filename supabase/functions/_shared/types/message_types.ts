@@ -171,7 +171,12 @@ type MediaPlaceholderPart = DataPart<
 
 type UnsupportedPart = DataPart<
   "unsupported",
-  UnsupportedMessage["unsupported"]
+  UnsupportedMessage["unsupported"] & {
+    // Meta's human-readable reason, e.g. "This message type is not
+    // currently supported". Kept alongside `type` so the raw cause survives
+    // even after the webhook's own logs roll off retention.
+    errors?: UnsupportedMessage["errors"];
+  }
 >;
 
 // Synthetic content for messaging_referral events (no message attached).

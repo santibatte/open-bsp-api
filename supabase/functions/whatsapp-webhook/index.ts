@@ -455,7 +455,10 @@ function webhookMessageToIncomingMessage(
         ...baseMessage,
         type: "data",
         kind: "unsupported",
-        data: message.unsupported,
+        data: {
+          ...message.unsupported,
+          ...(message.errors.length > 0 && { errors: message.errors }),
+        },
       };
 
     case "system": {
