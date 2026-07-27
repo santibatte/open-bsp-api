@@ -250,6 +250,9 @@ from new_contact;
 -- ============================================================
 -- Para pasar a producción real (después de validar con Santi)
 -- ============================================================
+-- ✅ Ejecutado 2026-07-26: `authorized_contacts_only` en false y
+-- `welcome_message` actualizado al texto con emojis (Botox Party + IPL
+-- agosto). Corrido a mano contra la Management API, no vía este script.
 -- update public.organizations
 -- set extra = extra || '{"authorized_contacts_only": false}'::jsonb
 -- where id = '<ORGANIZATION_ID>';

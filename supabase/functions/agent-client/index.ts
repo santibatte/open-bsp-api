@@ -49,6 +49,11 @@ export type AgentTool = {
 const PAUSED_CONV_WINDOW = 12 * 60 * 60 * 1000; // 12 hours
 const MESSAGES_TIME_LIMIT = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MESSAGES_QUANTITY_LIMIT = 50;
+// How long a conversation must be free of outgoing messages before the
+// welcome message fires again. Kept independent of MESSAGES_TIME_LIMIT
+// (which bounds the AI agent's context window) so tuning one doesn't
+// silently change the other.
+const WELCOME_MESSAGE_INACTIVITY_WINDOW = 24 * 60 * 60 * 1000; // 24 hours
 const RESPONSE_DELAY_SECS = 3; // 3 seconds
 const MEDIA_PREPROCESSING_TIMEOUT = 30 * 1000; // 30 seconds
 const MEDIA_PREPROCESSING_POLLING_INTERVAL = 5 * 1000; // 5 seconds
@@ -279,10 +284,22 @@ Deno.serve(async (req) => {
   // WELCOME MESSAGE
   // Note: The welcome message is affected by allowed contacts. This behavior
   // differs from WhatsApp, which sends the welcome message to all contacts.
+  //
+  // Mirrors WhatsApp Business App's native greeting message: it fires once
+  // whenever a contact writes in after the conversation has had no outgoing
+  // message for WELCOME_MESSAGE_INACTIVITY_WINDOW. `messages` already covers
+  // a wider window (MESSAGES_TIME_LIMIT, for AI context) so we just narrow it
+  // here instead of issuing a second query.
+
+  const recentMessages = messages.filter(
+    (m) =>
+      +new Date(m.timestamp) >
+        +new Date() - WELCOME_MESSAGE_INACTIVITY_WINDOW,
+  );
 
   if (
     org.extra.welcome_message &&
-    messages.every((m) => m.direction !== "outgoing")
+    recentMessages.every((m) => m.direction !== "outgoing")
   ) {
     const outgoing: MessageInsert = {
       organization_id: conv.organization_id,
