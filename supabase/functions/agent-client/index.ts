@@ -17,6 +17,7 @@ import {
 } from "../_shared/supabase.ts";
 import { ProtocolFactory } from "./protocols/index.ts";
 import { runGuardrail } from "./guardrail/index.ts";
+import { handleRecordatorioButtonReply } from "./recordatorio-buttons.ts";
 import { callTool, initMCP, type MCPServer } from "./tools/mcp.ts";
 import { Toolbox } from "./tools/index.ts";
 import { z } from "zod";
@@ -143,6 +144,28 @@ Deno.serve(async (req) => {
     has_org: !!org,
     has_contact_address: !!contact_address,
   });
+
+  // RECORDATORIO DE TURNO — RUTEO DE BOTONES (Confirmo / Reprogramar / Cancelar)
+  //
+  // Chequeo temprano, en el mismo espíritu que el chequeo de "mensaje no
+  // textual" que hace el guardrail más abajo, pero un escalón antes: corre
+  // ANTES de "CHECK IF CONTACT IS ALLOWED", "CHECK IF CONVERSATION IS PAUSED",
+  // el mensaje de bienvenida y la selección de agente IA — ninguno de esos
+  // gates de conversación aplica acá, porque esto no es una conversación con
+  // el bot: es la respuesta determinística a un template que YA mandamos
+  // nosotros (el recordatorio de turno de mañana, cron en Vercel). Si un
+  // "Cancelar" llegara a colarse en el guardrail/ReAct de más abajo, podría
+  // generar una respuesta de IA inconsistente con la cancelación real que
+  // hacemos acá. Ver recordatorio-buttons.ts para el detalle completo.
+  const recordatorioResult = await handleRecordatorioButtonReply({
+    client,
+    conversation,
+    incoming,
+  });
+
+  if (recordatorioResult.handled) {
+    return new Response("ok", { headers: corsHeaders });
+  }
 
   const organization_id = org.id;
 
