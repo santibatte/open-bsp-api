@@ -16,6 +16,7 @@ import {
   type WebhookPayload,
 } from "../_shared/supabase.ts";
 import { ProtocolFactory } from "./protocols/index.ts";
+import { runGuardrail } from "./guardrail/index.ts";
 import { callTool, initMCP, type MCPServer } from "./tools/mcp.ts";
 import { Toolbox } from "./tools/index.ts";
 import { z } from "zod";
@@ -389,6 +390,58 @@ Deno.serve(async (req) => {
   //---------------------------------------------------------------------------
   // Up to this point all checks passed. We can proceed with the response.
   //---------------------------------------------------------------------------
+
+  // GUARDRAIL DE DOS PASOS (redactor + juez)
+  //
+  // Cuando el agente tiene `extra.guardrail: true`, se corre un pipeline
+  // determinístico de dos llamados a Claude en vez del bucle ReAct genérico de
+  // abajo. Es una feature de seguridad médica (consultorio dermatológico): el
+  // bot solo puede repetir lo que está en el catálogo autorizado, y un segundo
+  // modelo verifica cada mensaje antes de que salga.
+  //
+  // Va ANTES del typing indicator a propósito: uno de los resultados posibles
+  // es no contestar nada, y mostrar "escribiendo..." para después quedarse
+  // callado es peor que no mostrar nada.
+  //
+  // Ver supabase/functions/agent-client/guardrail/ y
+  // supabase/vampiresa_meli/agent_guardrails.sql.
+
+  if (agent.extra?.guardrail) {
+    const incomingContent = newestMessage.content;
+
+    const mensajePaciente = incomingContent.type === "text"
+      ? incomingContent.text
+      : "";
+
+    if (!mensajePaciente.trim()) {
+      // Audio, imagen, documento, etc. El guardrail solo sabe evaluar texto
+      // contra el catálogo, así que no responde. Queda para revisión humana.
+      log.info(
+        `Guardrail: mensaje no textual (${incomingContent.type}) en la conversación ${conv.id}. No se responde.`,
+      );
+
+      return new Response("ok", { headers: corsHeaders });
+    }
+
+    const result = await runGuardrail({
+      client,
+      conversation: conv,
+      contact,
+      agent,
+      mensajePaciente,
+      headers: {
+        "organization-id": organization_id,
+        "conversation-id": conv.id,
+        "agent-id": agent.id,
+      },
+    });
+
+    log.info("Guardrail — resultado", result);
+
+    return new Response(JSON.stringify(result), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
 
   // TYPING INDICATOR
 

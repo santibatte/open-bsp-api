@@ -187,4 +187,14 @@ export type AIAgentExtra = {
   instructions?: string;
   send_inline_files_up_to_size_mb?: number;
   tools?: ToolConfig[];
+  /**
+   * Cuando es true, agent-client corre el pipeline de dos pasos
+   * (redactor + juez) en vez del bucle ReAct genérico, y `instructions`
+   * y `tools` se ignoran.
+   *
+   * Feature de seguridad médica del consultorio de la Vampiresa Meli:
+   * el bot solo puede repetir lo que está en el catálogo autorizado.
+   * Ver supabase/functions/agent-client/guardrail/.
+   */
+  guardrail?: boolean;
 };
