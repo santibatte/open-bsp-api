@@ -411,7 +411,12 @@ export async function runGuardrail(
   }
 
   // El "pase gratis" recién se cobra cuando el saludo se envió de verdad.
-  // Si fue tipo 'catalogo', el contador NO se toca.
+  //
+  // Solo 'saludo_generico' incrementa. 'catalogo' y 'pedir_precision' NO tocan
+  // el contador a propósito: las dos son consultas legítimas sobre el
+  // consultorio (una puntual, la otra demasiado amplia), no preguntas fuera de
+  // tema. Pedir que aclaren qué tratamiento le interesa no puede costarle a
+  // nadie su única pregunta de cortesía.
   if (redactor.tipo === "saludo_generico") {
     await incrementarOfftopic(client, contact);
   }
