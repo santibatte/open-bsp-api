@@ -36,7 +36,7 @@ create table if not exists public.agent_respuestas_no_enviadas (
                                   -- este log al ciclo de vida de conversations
   mensaje_paciente text not null,
   tipo_declarado   text not null
-    check (tipo_declarado in ('catalogo', 'saludo_generico', 'silencio')),
+    check (tipo_declarado in ('catalogo', 'pedir_precision', 'saludo_generico', 'silencio')),
   mensaje_borrador text not null default '',  -- vacío cuando tipo = 'silencio'
   motivo           text not null,  -- el motivo que devolvió el juez, o
                                    -- 'silencio - contador >= 1' si no hubo juez
