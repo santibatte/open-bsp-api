@@ -30,7 +30,11 @@ import type {
 } from "../../_shared/supabase.ts";
 import type { AgentRowWithExtra } from "../protocols/base.ts";
 import { callStructured, GuardrailLLMError } from "./anthropic.ts";
-import { cargarCatalogo, guardrailListo } from "./catalogo.ts";
+import {
+  cargarCatalogo,
+  guardrailListo,
+  MENSAJE_NO_TEXTUAL,
+} from "./catalogo.ts";
 import {
   type SalidaJuez,
   type SalidaRedactor,
@@ -48,7 +52,12 @@ export interface GuardrailParams {
   conversation: ConversationRow;
   contact?: ContactRow;
   agent: AgentRowWithExtra;
-  /** Texto del mensaje entrante de la paciente. */
+  /**
+   * Tipo del contenido entrante ("text", "file", ...). Cuando no es "text" se
+   * responde con una regla fija sin consultar al modelo.
+   */
+  tipoMensaje: string;
+  /** Texto del mensaje entrante. Vacío cuando `tipoMensaje` no es "text". */
   mensajePaciente: string;
   /** Headers de trazabilidad (organization-id, conversation-id, ...). */
   headers?: Record<string, string>;
@@ -175,8 +184,15 @@ async function enviarMensaje(
 export async function runGuardrail(
   params: GuardrailParams,
 ): Promise<GuardrailResult> {
-  const { client, conversation, contact, agent, mensajePaciente, headers } =
-    params;
+  const {
+    client,
+    conversation,
+    contact,
+    agent,
+    tipoMensaje,
+    mensajePaciente,
+    headers,
+  } = params;
 
   const offtopicCount = leerOfftopicCount(contact);
 
@@ -187,12 +203,43 @@ export async function runGuardrail(
   // gastar un llamado a Claude.
   if (!guardrailListo()) {
     log.warn(
-      "Guardrail activo pero falta config manual (SERVICIOS_HABILITADOS y/o CALENDLY_LINK). No se responde nada. Editar guardrail/catalogo.ts.",
+      "Guardrail activo pero SERVICIOS_HABILITADOS está vacío. No se responde nada. Editar guardrail/catalogo.ts.",
     );
 
     return {
       enviado: false,
       motivo: "configuración del catálogo pendiente",
+    };
+  }
+
+  // ── Mensaje no textual: respuesta fija, sin LLM ──
+  // Foto, audio, documento, ubicación, lo que sea. Es una regla por TIPO de
+  // mensaje, no por contenido, así que no necesita redactor ni juez: no hay
+  // nada que redactar (el texto es constante) ni nada que verificar (no puede
+  // contener información inventada sobre tratamientos).
+  //
+  // Va antes de cargar el catálogo y antes del chequeo de API key a propósito:
+  // esta respuesta no depende de ninguno de los dos.
+  //
+  // NO toca el contador de fuera-de-tema: el contador cuenta preguntas que no
+  // sabemos contestar, no formatos que no sabemos leer. Mandar tres fotos no
+  // debería quemarle a nadie el "pase gratis" de su primera pregunta.
+  if (tipoMensaje !== "text") {
+    log.info(
+      `Guardrail — mensaje no textual (${tipoMensaje}): redirección fija a mail`,
+    );
+
+    try {
+      await enviarMensaje(client, conversation, agent, MENSAJE_NO_TEXTUAL);
+    } catch (error) {
+      log.error("Falló el envío de la redirección a mail", error as Error);
+
+      return { enviado: false, motivo: "error al enviar" };
+    }
+
+    return {
+      enviado: true,
+      motivo: `redirección a mail por mensaje no textual (${tipoMensaje})`,
     };
   }
 

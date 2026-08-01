@@ -413,14 +413,12 @@ Deno.serve(async (req) => {
       ? incomingContent.text
       : "";
 
-    if (!mensajePaciente.trim()) {
-      // Audio, imagen, documento, etc. El guardrail solo sabe evaluar texto
-      // contra el catálogo, así que no responde. Queda para revisión humana.
-      log.info(
-        `Guardrail: mensaje no textual (${incomingContent.type}) en la conversación ${conv.id}. No se responde.`,
-      );
+    // Un texto en blanco se trata como no textual: el guardrail responde con la
+    // redirección fija a mail en vez de mandarle al modelo un mensaje vacío.
+    let tipoMensaje: string = incomingContent.type || "unknown";
 
-      return new Response("ok", { headers: corsHeaders });
+    if (tipoMensaje === "text" && !mensajePaciente.trim()) {
+      tipoMensaje = "texto vacío";
     }
 
     const result = await runGuardrail({
@@ -428,6 +426,7 @@ Deno.serve(async (req) => {
       conversation: conv,
       contact,
       agent,
+      tipoMensaje,
       mensajePaciente,
       headers: {
         "organization-id": organization_id,

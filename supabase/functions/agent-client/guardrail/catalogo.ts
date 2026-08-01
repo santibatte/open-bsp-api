@@ -8,7 +8,7 @@
  * necesidad de redeployar la Edge Function.
  *
  * ══════════════════════════════════════════════════════════════════
- * LO ÚNICO QUE SE EDITA A MANO ACÁ: SERVICIOS_HABILITADOS y CALENDLY_LINK
+ * LO ÚNICO QUE FALTA EDITAR A MANO ACÁ: SERVICIOS_HABILITADOS
  * ══════════════════════════════════════════════════════════════════
  *
  * `precios_vigentes` tiene los 32 servicios que el consultorio cobra. Eso NO
@@ -43,20 +43,43 @@ export const SERVICIOS_HABILITADOS: string[] = [];
 
 /**
  * Link de Calendly para agendar consulta. Se usa en el mensaje de tipo
- * `saludo_generico`. En setup.sql figura como <CALENDLY_LINK>, todavía sin
- * resolver (ver la nota en system_prompt.md).
+ * `saludo_generico`.
+ *
+ * Es el event type genérico de 30 min ("Turno Dermatología - Dra. Melisa
+ * Altavista"), NO los links de promo específicos — esos cambian por campaña y
+ * el bot no tiene forma de saber cuál corresponde.
  */
-export const CALENDLY_LINK = `{{CALENDLY_LINK_PENDIENTE}}`;
+export const CALENDLY_LINK = "https://calendly.com/dra-melisa-altavista/30min";
 
 /** Nombre de la doctora tal como el bot debe presentarse. */
 export const NOMBRE_DOCTORA = "Dra. Melisa Altavista";
+
+/**
+ * Mail al que se redirige TODO lo que sea consulta médica real: diagnósticos,
+ * recetas, preguntas sobre el caso particular de la persona.
+ *
+ * Decisión explícita de Santi: se redirige a mail, NO a un humano por WhatsApp.
+ */
+export const MAIL_CONSULTAS = "dra.melisa.altavista@gmail.com";
+
+/**
+ * Respuesta fija para mensajes que no son texto (foto, audio, documento).
+ *
+ * No pasa por redactor ni por juez: es una regla por TIPO de mensaje, no por
+ * contenido, así que no hace falta un LLM para decidirla — y por lo tanto
+ * tampoco puede inventar nada. Tampoco consume el contador de fuera-de-tema:
+ * el contador cuenta preguntas que no sabemos contestar, no formatos que no
+ * sabemos leer.
+ */
+export const MENSAJE_NO_TEXTUAL =
+  `Para consultas médicas, diagnósticos o recetas, escribinos directamente a ${MAIL_CONSULTAS} — por acá solo puedo darte información sobre tratamientos.`;
 
 /**
  * true cuando ya está todo lo que se edita a mano. Mientras devuelva false, el
  * guardrail no gasta ni un llamado a Claude y no responde nada.
  */
 export function guardrailListo(): boolean {
-  return SERVICIOS_HABILITADOS.length > 0 && !CALENDLY_LINK.includes("{{");
+  return SERVICIOS_HABILITADOS.length > 0;
 }
 
 interface PrecioRow {
