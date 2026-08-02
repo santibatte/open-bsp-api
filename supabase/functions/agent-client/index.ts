@@ -103,11 +103,19 @@ function getNewestIncomingMessage(
 }
 
 /**
+ * Ventana máxima entre dos mensajes de la misma "tanda" (ver
+ * `getIncomingBurstText`). Más que esto ya no es alguien tipeando seguido,
+ * es una conversación distinta — no hay que fusionarlas.
+ */
+const BURST_MAX_GAP_MS = 2 * 60 * 1000;
+
+/**
  * Junta el texto de todos los mensajes ENTRANTES consecutivos que terminan en
- * `newestMessage`, sin ningún mensaje saliente en el medio — cubre el caso de
- * alguien mandando la misma idea en varios mensajes seguidos ("Quiero saber
- * del botox" + "y cuánto sale"). Solo tiene sentido cuando `messages` ya viene
- * en orden cronológico ascendente.
+ * `newestMessage`, sin ningún mensaje saliente en el medio y sin que pase más
+ * de `BURST_MAX_GAP_MS` entre uno y el siguiente — cubre el caso de alguien
+ * mandando la misma idea en varios mensajes seguidos ("Quiero saber del
+ * botox" + "y cuánto sale"). Solo tiene sentido cuando `messages` ya viene en
+ * orden cronológico ascendente.
  *
  * Antes el guardrail solo miraba el texto del último mensaje de la tanda, así
  * que perdía el contexto de los anteriores (encontrado 2026-08-02 probando en
@@ -115,8 +123,16 @@ function getNewestIncomingMessage(
  * "que tal", sin problema porque ambos eran equivalentes, pero con contenido
  * distinto se hubiera perdido información real).
  *
+ * El límite de tiempo se agregó el mismo día al encontrar el caso contrario:
+ * si el juez rechaza cada borrador, nunca se inserta un mensaje saliente que
+ * corte la racha, así que sin este tope la función seguía juntando TODOS los
+ * mensajes sin responder de la conversación (en un caso real, más de una hora
+ * y cuatro mensajes de temas distintos en un solo bloque), produciendo un
+ * `mensajePaciente` mezclado que ningún tipo de respuesta podía cubrir bien.
+ *
  * Mensajes no textuales dentro de la tanda no se concatenan (no hay texto que
- * sumar de una foto) pero tampoco cortan la racha.
+ * sumar de una foto) pero tampoco cortan la racha (si están dentro de la
+ * ventana de tiempo).
  */
 function getIncomingBurstText(
   messages: MessageRow[],
@@ -131,11 +147,18 @@ function getIncomingBurstText(
   }
 
   const textos: string[] = [];
+  let ultimoTimestamp = +new Date(messages[newestIndex].created_at);
 
   for (let i = newestIndex; i >= 0; i--) {
     const mensaje = messages[i];
 
     if (mensaje.direction !== "incoming") break;
+
+    const timestamp = +new Date(mensaje.created_at);
+
+    if (ultimoTimestamp - timestamp > BURST_MAX_GAP_MS) break;
+
+    ultimoTimestamp = timestamp;
 
     if (mensaje.content.type === "text" && mensaje.content.text.trim()) {
       textos.unshift(mensaje.content.text.trim());
