@@ -60,8 +60,25 @@ import type { JSONSchema } from "./anthropic.ts";
  *                "mezclar precios" ni "varios tratamientos a la vez" (eso es
  *                para tratamientos DISTINTOS, no variantes de la misma
  *                familia).
+ * v8 (pendiente — completar tras commit) — primera corrida completa del
+ *                golden set (9/9 casos) contra v7 encontró dos problemas más
+ *                (ver Incidente 8): (a) el juez confundía los montos de SEÑA
+ *                de la FAQ operativa ($20.000/$50.000, fijos) con "precios de
+ *                tratamiento", rechazando un "faq" válido y pidiendo
+ *                "pedir_precision" — se aclara que esos dos montos son datos
+ *                FAQ, no están sujetos a esa regla; (b) el redactor seguía
+ *                confundiendo "saludo_generico" vs "fuera_de_tema" según el
+ *                CONTENIDO del mensaje (si "sonaba" a saludo o no) en vez de
+ *                mirar solo el contador — se agrega una aclaración explícita
+ *                de que la elección depende ÚNICAMENTE del número del
+ *                contador. Nota: el golden set también encontró que el juez
+ *                rechaza de forma inconsistente el mismo patrón que aprobó en
+ *                v7 (precio de Botox maceteros/tercio superior, ejemplo
+ *                literal ya nombrado en el prompt) — queda registrado como
+ *                inconsistencia conocida del modelo, no se persigue más por
+ *                ahora (ver Incidente 8).
  */
-export const PROMPT_VERSION = 7;
+export const PROMPT_VERSION = 8;
 
 /**
  * Los ocho tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -315,6 +332,11 @@ CÓMO ELEGIR EL "tipo"
    Qué va en "mensaje": SOLO la información literal de esa sección que
    responde la pregunta. Cero agregados, igual que con el catálogo de
    tratamientos.
+   Los montos de SEÑA de esa sección (consulta médica $20.000, IPL/NIR
+   $50.000) son datos operativos FIJOS, NO precios de tratamiento — está bien
+   incluirlos en una respuesta "faq" (por ejemplo junto con horarios o
+   política de cancelación) sin que eso la convierta en "pedir_precision" ni
+   haga falta preguntar antes qué tratamiento le interesa.
    IMPORTANTE — esto NO es "faq": preguntas sobre el estado de un turno
    PUNTUAL de la paciente ("¿quedó bien agendado mi turno?", "no recuerdo el
    día/horario de mi turno"). Ninguna información de esa sección permite
@@ -354,6 +376,14 @@ CÓMO ELEGIR EL "tipo"
    genérico, sin importar el contador de abajo: una consulta de seguimiento
    SIEMPRE se contesta con la derivación a mail, aunque esta persona ya haya
    usado su saludo de cortesía o preguntado cosas fuera de tema antes.
+
+La diferencia entre los tipos 6 y 7 de abajo depende ÚNICA Y EXCLUSIVAMENTE
+del número del contador de arriba — nunca de cómo "suena" el mensaje. No
+importa si el mensaje parece una pregunta trivial, un tema random, deportes,
+matemática o lo que sea: contador en 0 → SIEMPRE "saludo_generico"; contador
+en 1 o más → SIEMPRE "fuera_de_tema". El contenido del mensaje fuera de tema
+no participa en esta decisión, solo decide QUE es fuera de tema (no cuál de
+los dos tipos usar).
 
 6) tipo = "saludo_generico"
    Cuándo: la pregunta es sobre CUALQUIER otra cosa (otro tema médico, un tema
@@ -552,6 +582,12 @@ Si el tipo declarado es "faq":
   Aprobás SOLO si CADA dato del mensaje está literalmente en la sección de FAQ
   operativa autorizada de arriba. Cualquier dato agregado, interpretado o
   inventado → RECHAZAR.
+  Los montos de SEÑA de esa sección (consulta médica $20.000, IPL/NIR
+  $50.000) son datos operativos fijos, NO precios de tratamiento — que el
+  mensaje los mencione (solos o junto con horarios/cancelación/otro dato FAQ)
+  NO lo convierte en "pedir_precision" ni amerita rechazo por eso. La regla
+  de "pedir_precision"/"cero cifras" es sobre PRECIOS DE TRATAMIENTO
+  (precios_vigentes), no sobre estos dos montos fijos de seña.
   Rechazá también si el mensaje confirma o niega el estado de un turno
   puntual de la paciente (agendado, cancelado, a qué hora, a nombre de qué
   mail) — ningún dato de la FAQ operativa autoriza eso, no hay forma de
