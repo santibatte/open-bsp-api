@@ -69,16 +69,38 @@ export interface GuardrailResult {
   motivo: string;
 }
 
+const VEINTICUATRO_HORAS_MS = 24 * 60 * 60 * 1000;
+
 /**
  * Lee el contador de fuera-de-tema del contacto. Ausente = 0.
+ *
+ * Expira a las 24hs (pedido de Santi, 2026-08-02: "que no exista el
+ * resetear a mano"): si `offtopic_updated_at` es más viejo que eso, se lee
+ * como 0 aunque el número guardado sea mayor. `bump_offtopic_count()` (SQL)
+ * aplica la misma regla del lado de la ESCRITURA — esto cubre el caso de que
+ * pasen 24hs sin que llegue un mensaje nuevo que dispare un bump.
  */
 function leerOfftopicCount(contact?: ContactRow): number {
-  const raw = (contact?.extra as Record<string, unknown> | null | undefined)
-    ?.offtopic_count;
+  const extra = contact?.extra as Record<string, unknown> | null | undefined;
+  const raw = extra?.offtopic_count;
 
   const parsed = typeof raw === "number" ? raw : Number(raw);
+  const count = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
 
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+  if (count === 0) return 0;
+
+  const updatedAtRaw = extra?.offtopic_updated_at;
+  const updatedAt = typeof updatedAtRaw === "string"
+    ? new Date(updatedAtRaw)
+    : null;
+
+  if (!updatedAt || Number.isNaN(+updatedAt)) {
+    // Sin timestamp (dato viejo, de antes de este cambio): no se puede saber
+    // si venció, se respeta el valor tal cual.
+    return count;
+  }
+
+  return +new Date() - +updatedAt > VEINTICUATRO_HORAS_MS ? 0 : count;
 }
 
 /**

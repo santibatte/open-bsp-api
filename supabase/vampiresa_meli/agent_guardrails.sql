@@ -103,32 +103,68 @@ alter table public.agent_respuestas_no_enviadas
 -- si llegan dos mensajes muy seguidos del mismo contacto, dos invocaciones
 -- concurrentes de agent-client harían ambas `read 0 -> write 1` y el contador
 -- quedaría en 1 en vez de 2 (el paciente se ganaría un "pase gratis" extra).
--- Acá el UPDATE toma el row lock, entonces el read-modify-write pasa entero
--- adentro de una sola sentencia y la segunda transacción ve el valor ya
+-- Acá el `select ... for update` toma el row lock ANTES de decidir el valor
+-- nuevo, entonces el read-modify-write pasa entero adentro de una sola
+-- transacción y la segunda invocación concurrente espera y ve el valor ya
 -- incrementado. El `|| jsonb_build_object(...)` hace merge: NO pisa las otras
 -- claves de `extra`.
 --
 -- Devuelve el valor YA incrementado, o null si el contacto no existe.
+--
+-- ── Expiración a las 24hs (agregado 2026-08-02, pedido de Santi: "que no
+-- exista el resetear a mano") ──
+-- Si pasaron más de 24hs desde la última pregunta fuera de tema
+-- (`offtopic_updated_at`), el contador arranca de nuevo en 1 en vez de seguir
+-- sumando. `leerOfftopicCount()` en `guardrail/index.ts` aplica la misma
+-- regla del lado de LECTURA (por si pasan 24hs sin que llegue ningún mensaje
+-- nuevo que dispare un bump — la primera lectura después de la ventana ya
+-- tiene que ver 0, no esperar a la próxima escritura).
 
 create or replace function public.bump_offtopic_count(_contact_id uuid)
 returns integer
-language sql
+language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  _extra         jsonb;
+  _last_updated  timestamptz;
+  _current       integer;
+  _new           integer;
+begin
+  select extra,
+         (extra ->> 'offtopic_updated_at')::timestamptz,
+         coalesce((extra ->> 'offtopic_count')::integer, 0)
+    into _extra, _last_updated, _current
+    from public.contacts
+   where id = _contact_id
+     for update;
+
+  if not found then
+    return null;
+  end if;
+
+  if _last_updated is null or _last_updated < now() - interval '24 hours' then
+    _new := 1;
+  else
+    _new := _current + 1;
+  end if;
+
   update public.contacts
-     set extra = coalesce(extra, '{}'::jsonb)
+     set extra = coalesce(_extra, '{}'::jsonb)
                || jsonb_build_object(
-                    'offtopic_count',
-                    coalesce((extra ->> 'offtopic_count')::integer, 0) + 1
+                    'offtopic_count', _new,
+                    'offtopic_updated_at', now()
                   ),
          updated_at = now()
-   where id = _contact_id
-  returning (extra ->> 'offtopic_count')::integer;
+   where id = _contact_id;
+
+  return _new;
+end;
 $$;
 
 comment on function public.bump_offtopic_count(uuid) is
-  'Incrementa atómicamente contacts.extra.offtopic_count y devuelve el valor nuevo. Usado por agent-client cuando el bot gasta el "pase gratis" (saludo_generico aprobado) o cuando silencia una repregunta fuera de tema.';
+  'Incrementa atómicamente contacts.extra.offtopic_count y devuelve el valor nuevo (arranca de nuevo en 1 si pasaron más de 24hs desde offtopic_updated_at). Usado por agent-client cuando el bot gasta el "pase gratis" (saludo_generico aprobado) o cuando manda un recordatorio de alcance (fuera_de_tema).';
 
 grant execute on function public.bump_offtopic_count(uuid) to service_role;
 
