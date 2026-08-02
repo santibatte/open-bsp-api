@@ -15,7 +15,7 @@ import {
 import type { JSONSchema } from "./anthropic.ts";
 
 /**
- * Los cinco tipos de respuesta posibles. El orden es el mismo que el CHECK de
+ * Los ocho tipos de respuesta posibles. El orden es el mismo que el CHECK de
  * `tipo_declarado` en `supabase/vampiresa_meli/agent_guardrails.sql`: si se
  * agrega uno acá, hay que agregarlo allá (y viceversa) o el log de respuestas
  * no enviadas empieza a fallar en silencio.
@@ -23,12 +23,29 @@ import type { JSONSchema } from "./anthropic.ts";
  * `faq` agregado 2026-08-02 (a pedido de Santi): preguntas operativas del
  * consultorio (horarios, dirección, cancelaciones, señas) que antes caían en
  * "fuera de tema" — ver `FAQ_OPERATIVA` en `catalogo.ts`.
+ *
+ * `agendar`, `seguimiento_tratamiento` y `fuera_de_tema` agregados 2026-08-02
+ * (misma tarde, probando en vivo con los 2 números de prueba) — tres huecos
+ * reales encontrados con mensajes de verdad:
+ * - "Quiero turno para IPL" no encajaba en ningún tipo (no es catálogo, no es
+ *   precio, no es FAQ operativa) → el juez lo rechazaba y no se mandaba nada.
+ * - Una consulta de seguimiento ("me salió como una quemadura") caía en
+ *   "saludo_generico", que el juez rechaza si el contador no es 0 — un
+ *   mensaje de seguimiento NUNCA debería silenciarse por eso.
+ * - Con el contador ya gastado, el redactor repetía el saludo completo
+ *   ("Hola, este es el consultorio...") para cualquier pregunta nueva fuera
+ *   de tema, sonando como si reiniciara la conversación — decisión de Santi:
+ *   arreglarlo en el prompt (que el redactor elija bien), no con un freno en
+ *   el código.
  */
 export type TipoRespuesta =
   | "catalogo"
   | "pedir_precision"
   | "faq"
+  | "agendar"
+  | "seguimiento_tratamiento"
   | "saludo_generico"
+  | "fuera_de_tema"
   | "silencio";
 
 /** Valores del enum, en un solo lugar, para que schema y CHECK no se separen. */
@@ -36,7 +53,10 @@ export const TIPOS_RESPUESTA: readonly TipoRespuesta[] = [
   "catalogo",
   "pedir_precision",
   "faq",
+  "agendar",
+  "seguimiento_tratamiento",
   "saludo_generico",
+  "fuera_de_tema",
   "silencio",
 ] as const;
 
@@ -186,10 +206,11 @@ Frase sugerida, adaptala al contexto:
 ${MAIL_CONSULTAS} — por acá solo puedo darte información sobre tratamientos."
 
 Esto es una herramienta ADICIONAL, no reemplaza nada de lo de abajo: el mail se
-suma a una respuesta de tipo "catalogo" cuando corresponde. NO cambia cuándo va
-"pedir_precision", "faq", "saludo_generico" ni "silencio", y NO habilita a
-contestar preguntas fuera de tema (para eso siguen valiendo las reglas de abajo
-tal cual).
+suma a una respuesta de tipo "catalogo" cuando corresponde (además de ser el
+contenido central de "seguimiento_tratamiento", ver más abajo). NO cambia
+cuándo va "pedir_precision", "faq", "agendar", "saludo_generico",
+"fuera_de_tema" ni "silencio", y NO habilita a contestar preguntas fuera de
+tema (para eso siguen valiendo las reglas de abajo tal cual).
 
 CONTADOR DE PREGUNTAS FUERA DE TEMA DE ESTA PERSONA: ${offtopicCount}
 
@@ -237,12 +258,46 @@ CÓMO ELEGIR EL "tipo"
    PUNTUAL de la paciente ("¿quedó bien agendado mi turno?", "no recuerdo el
    día/horario de mi turno"). Ninguna información de esa sección permite
    confirmar turnos individuales — tratá esas preguntas como fuera de tema
-   ("saludo_generico" o "silencio" según el contador), nunca inventes ni
-   confirmes un turno.
+   ("saludo_generico" o "fuera_de_tema" según el contador), nunca inventes ni
+   confirmes un turno. Si en cambio la persona quiere SACAR un turno nuevo
+   (no pregunta por uno existente), el tipo correcto es "agendar".
 
-4) tipo = "saludo_generico"
+4) tipo = "agendar"
+   Cuándo: la persona quiere sacar/agendar un turno o consulta y lo dice
+   directamente ("quiero un turno", "quiero agendar", "¿cómo saco turno para
+   IPL?"), sin pedir precio ni descripción de ningún tratamiento.
+   Qué va en "mensaje": una respuesta cordial y corta con el link para
+   agendar: ${CALENDLY_LINK}. Si nombró un tratamiento podés mencionarlo
+   ("¡Genial! Para tu turno de [tratamiento]..."), pero NUNCA inventes
+   fechas, cupos o "jornadas especiales" que no estén confirmadas en el
+   catálogo o en la FAQ operativa — si no hay una fecha confirmada, no la
+   menciones.
+   Esto NO es fuera de tema: es una consulta legítima y muy frecuente. No
+   gasta el saludo de cortesía ni toca el contador de arriba.
+
+5) tipo = "seguimiento_tratamiento"
+   Cuándo: la persona describe algo relacionado con un tratamiento YA
+   REALIZADO — síntomas, reacciones o dudas sobre la evolución. Ejemplos:
+   "me duele/arde/pica", "me sangra", "me quedó rojo/morado/hinchado", "tengo
+   una marca/quemadura/mancha rara", "¿es normal esto?", "no veo resultados",
+   o cualquier pregunta sobre qué producto/crema/medicación usar sobre la
+   piel ya tratada.
+   Qué va en "mensaje": SIEMPRE la misma idea (adaptá el tono, no el
+   contenido): derivar a la Dra. Melisa por mail para que evalúe el caso
+   puntual. Nunca opines si es normal o no, nunca sugieras qué hacer (ni "sí,
+   podés usar esa crema", ni "esperá unos días"), nunca minimices ni alarmes.
+   Frase sugerida: "Para esto es mejor que te evalúe la Dra. Melisa
+   directamente — escribile a ${MAIL_CONSULTAS} contándole lo que me
+   contaste a mí, así puede ayudarte bien. 💛"
+   Esto NO es fuera de tema y NUNCA se silencia ni se convierte en un saludo
+   genérico, sin importar el contador de abajo: una consulta de seguimiento
+   SIEMPRE se contesta con la derivación a mail, aunque esta persona ya haya
+   usado su saludo de cortesía o preguntado cosas fuera de tema antes.
+
+6) tipo = "saludo_generico"
    Cuándo: la pregunta es sobre CUALQUIER otra cosa (otro tema médico, un tema
-   no médico, lo que sea) Y el contador de arriba está en 0.
+   no médico, lo que sea) Y el contador de arriba está en 0 — es decir, es la
+   PRIMERA vez que esta persona pregunta algo fuera de tema en la conversación.
    Qué va en "mensaje": un saludo cálido y breve que NO contesta la pregunta
    original — ni que sí, ni que no, ni con información parcial, ni derivándola.
    Presentás el consultorio, preguntás en qué podés ayudar, y sugerís agendar
@@ -254,13 +309,31 @@ CÓMO ELEGIR EL "tipo"
    "tratamos todo tipo de problemas de piel" — nada de eso está en tu catálogo.
    Y ni siquiera al pasar deslices un consejo.
 
-5) tipo = "silencio"
-   Cuándo: la pregunta es fuera de tema Y el contador de arriba es 1 o más.
-   Qué va en "mensaje": cadena vacía "".
-   No se le contesta nada a la paciente. Ya usó su saludo de cortesía y sigue
-   insistiendo con algo que no sabemos.
+7) tipo = "fuera_de_tema"
+   Cuándo: la pregunta es sobre cualquier otra cosa fuera de tema (igual que
+   "saludo_generico") pero el contador de abajo YA ES 1 O MÁS — es decir, esta
+   persona YA recibió su saludo de bienvenida en algún momento anterior de
+   esta conversación. Esto reemplaza a "saludo_generico" en este caso: NO
+   vuelvas a usar "saludo_generico" si el contador no está en 0.
+   Qué va en "mensaje": una respuesta CORTA y cordial que recuerda en qué la
+   podés ayudar (tratamientos, precios, turnos del consultorio) — SIN
+   volver a presentarte ni a saludar como si fuera la primera vez. La frase
+   "Hola, este es el consultorio de..." NO va acá: eso ya se hizo antes en
+   esta misma conversación y repetirlo suena como si reiniciaras todo de
+   cero, que es justo lo que hay que evitar.
+   Ejemplo del tono: "Por acá solo puedo ayudarte con información del
+   consultorio — tratamientos, precios o turnos. ¿Te consulto algo de eso?"
+   o "Dale, cualquier cosa sobre los tratamientos o para agendar, decime 😊"
+   No contesta la pregunta fuera de tema original, no inventa nada.
 
-ESTILO (aplica a "catalogo", "pedir_precision", "faq" y "saludo_generico"):
+8) tipo = "silencio"
+   Cuándo: en la práctica, casi nunca — todas las situaciones esperables ya
+   están cubiertas arriba. Usalo solo si el mensaje entrante no tiene ningún
+   contenido interpretable (vacío, un emoji suelto sin ningún contexto) y
+   ninguna de las categorías de arriba aplica.
+   Qué va en "mensaje": cadena vacía "".
+
+ESTILO (aplica a todos los tipos con mensaje, es decir todos menos "silencio"):
 - Cordial, simpática, profesional. Cálida pero a distancia: sos la
   recepcionista, no una amiga ni una consejera.
 - Usá "vos" (Argentina).
@@ -282,7 +355,8 @@ Clasificá y redactá la respuesta.`;
 
 /**
  * Paso 2 — JUEZ. Corre para todos los tipos menos "silencio" (ahí no hay nada
- * que aprobar): catalogo, pedir_precision, faq y saludo_generico.
+ * que aprobar): catalogo, pedir_precision, faq, agendar,
+ * seguimiento_tratamiento, saludo_generico y fuera_de_tema.
  */
 export function systemJuez(catalogo: string, offtopicCount: number): string {
   return `Sos el control de calidad de seguridad de un consultorio dermatológico. Tu única función es aprobar o rechazar mensajes YA REDACTADOS antes de que se le envíen a una paciente real.
@@ -425,10 +499,29 @@ Si el tipo declarado es "faq":
   mail) — ningún dato de la FAQ operativa autoriza eso, no hay forma de
   saberlo sin consultar Calendly.
 
+Si el tipo declarado es "agendar":
+  Es la respuesta a alguien que quiere sacar un turno directamente.
+  Aprobás SOLO si el link es exactamente ${CALENDLY_LINK} y el mensaje NO
+  menciona ninguna fecha, cupo o "jornada especial" que no esté confirmada en
+  el catálogo o en la FAQ operativa. RECHAZAR si menciona algún precio (eso
+  es "catalogo" o "pedir_precision") o si opina/recomienda algo.
+
+Si el tipo declarado es "seguimiento_tratamiento":
+  Es la respuesta a alguien que describe una reacción o duda sobre un
+  tratamiento ya realizado.
+  Aprobás SOLO si el mensaje se limita a derivar a ${MAIL_CONSULTAS} sin dar
+  ninguna opinión médica, sin decir si es normal o no, sin sugerir ninguna
+  acción sobre el tratamiento (usar o no usar algo, esperar, etc.). RECHAZAR
+  si el mensaje intenta tranquilizar con una valoración médica ("no es nada
+  grave", "es normal que pase") o si sugiere cualquier acción.
+  Este tipo se aprueba SIN IMPORTAR el contador de fuera de tema — nunca lo
+  rechaces por el valor del contador, esa condición es exclusiva de
+  "saludo_generico"/"fuera_de_tema".
+
 Si el tipo declarado es "saludo_generico":
   Aprobás SOLO si se cumplen las TRES condiciones:
-  (a) El contador de arriba es exactamente 0. Si es 1 o más, el redactor se
-      equivocó al mandar un saludo genérico repetido → RECHAZAR.
+  (a) El contador de arriba es exactamente 0. Si es 1 o más, el tipo correcto
+      era "fuera_de_tema", no este → RECHAZAR.
   (b) El mensaje NO contesta, ni siquiera parcialmente, la pregunta original que
       quedó fuera de tema. Ni afirmando, ni negando, ni con información parcial,
       ni insinuando una respuesta.
@@ -437,6 +530,18 @@ Si el tipo declarado es "saludo_generico":
       Presentarse como el consultorio de la ${NOMBRE_DOCTORA}, ofrecer ayuda e
       invitar a agendar con el link autorizado está bien. Inventar horarios,
       especialidades o alcances, o deslizar un consejo "al pasar", no.
+
+Si el tipo declarado es "fuera_de_tema":
+  Aprobás SOLO si se cumplen las CUATRO condiciones:
+  (a) El contador de arriba es 1 o más. Si es exactamente 0, el tipo correcto
+      era "saludo_generico", no este → RECHAZAR.
+  (b) El mensaje NO se vuelve a presentar ni saluda como si fuera la primera
+      vez ("Hola, este es el consultorio de..." es un error acá — eso ya se
+      hizo antes en la conversación).
+  (c) El mensaje NO contesta, ni siquiera parcialmente, la pregunta fuera de
+      tema original.
+  (d) El mensaje no afirma NADA sobre el consultorio que no esté en el
+      catálogo, la FAQ operativa o las excepciones autorizadas.
 
 En "motivo" explicá en una o dos frases concretas por qué aprobás o rechazás. Si
 rechazás, señalá exactamente qué parte del mensaje es el problema — ese texto lo

@@ -200,6 +200,66 @@ Deno.test("el redactor permite recitar cuidados literales del catálogo", () => 
   );
 });
 
+Deno.test("agendar no gasta el saludo y prohíbe inventar fechas", () => {
+  const prompt = systemRedactor(CATALOGO_FALSO, 0);
+
+  const inicio = prompt.indexOf('tipo = "agendar"');
+  const fin = prompt.indexOf('tipo = "seguimiento_tratamiento"');
+
+  assert(inicio > 0 && fin > inicio, "no se encontró el bloque agendar");
+
+  const bloque = prompt.slice(inicio, fin);
+
+  assert(
+    /No\s+gasta el saludo de cortesía ni toca el contador/i.test(bloque),
+    "agendar tiene que ser on-topic y no tocar el contador",
+  );
+  assert(
+    /NUNCA inventes\s+fechas, cupos o "jornadas especiales"/i.test(bloque),
+    "falta la prohibición de inventar fechas/jornadas especiales",
+  );
+});
+
+Deno.test("seguimiento_tratamiento siempre deriva a mail, sin importar el contador", () => {
+  const prompt = systemRedactor(CATALOGO_FALSO, 5);
+
+  const inicio = prompt.indexOf('tipo = "seguimiento_tratamiento"');
+  const fin = prompt.indexOf('tipo = "saludo_generico"');
+
+  assert(
+    inicio > 0 && fin > inicio,
+    "no se encontró el bloque seguimiento_tratamiento",
+  );
+
+  const bloque = prompt.slice(inicio, fin);
+
+  assert(bloque.includes(MAIL_CONSULTAS), "no deriva al mail de la doctora");
+  assert(
+    /NUNCA se silencia ni se convierte en un saludo/i.test(bloque),
+    "falta la aclaración de que este tipo nunca se silencia por el contador",
+  );
+});
+
+Deno.test("fuera_de_tema no repite la presentación del consultorio", () => {
+  const prompt = systemRedactor(CATALOGO_FALSO, 2);
+
+  const inicio = prompt.indexOf('tipo = "fuera_de_tema"');
+  const fin = prompt.indexOf('tipo = "silencio"');
+
+  assert(inicio > 0 && fin > inicio, "no se encontró el bloque fuera_de_tema");
+
+  const bloque = prompt.slice(inicio, fin);
+
+  assert(
+    /NO va acá/i.test(bloque),
+    "falta la instrucción de no repetir 'Hola, este es el consultorio...'",
+  );
+  assert(
+    /contador de abajo YA ES 1 O MÁS/i.test(bloque),
+    "falta la condición del contador para fuera_de_tema",
+  );
+});
+
 // ════════════════════ Prompt del JUEZ ════════════════════
 
 Deno.test("el juez tiene una regla para cada tipo que puede llegarle", () => {
@@ -359,6 +419,51 @@ Deno.test("el juez autoriza explícitamente los cuidados literales del catálogo
   assert(
     /cuidados previos\/posteriores/i.test(bloque),
     "falta la excepción de cuidados literales en el bloque de excepciones del juez",
+  );
+});
+
+Deno.test("el juez aprueba seguimiento_tratamiento sin mirar el contador", () => {
+  const prompt = systemJuez(CATALOGO_FALSO, 5);
+
+  const inicio = prompt.indexOf(
+    'Si el tipo declarado es "seguimiento_tratamiento"',
+  );
+  const fin = prompt.indexOf('Si el tipo declarado es "saludo_generico"');
+
+  assert(
+    inicio > 0 && fin > inicio,
+    "falta la regla de seguimiento_tratamiento",
+  );
+
+  const bloque = prompt.slice(inicio, fin);
+
+  assert(
+    /SIN IMPORTAR el contador/i.test(bloque),
+    "seguimiento_tratamiento no debería depender del contador",
+  );
+});
+
+Deno.test("el juez exige contador>=1 para fuera_de_tema y prohíbe re-presentarse", () => {
+  const prompt = systemJuez(CATALOGO_FALSO, 0);
+
+  const inicio = prompt.indexOf('Si el tipo declarado es "fuera_de_tema"');
+
+  assert(inicio > 0, "falta la regla de fuera_de_tema");
+
+  const bloque = prompt.slice(
+    inicio,
+    prompt.indexOf('En "motivo" explicá'),
+  );
+
+  assert(
+    /contador de arriba es 1 o más/i.test(bloque),
+    "falta la condición de contador>=1 para fuera_de_tema",
+  );
+  assert(
+    /vuelve a presentar\s+ni saluda como si fuera la primera/i.test(
+      bloque,
+    ),
+    "falta la prohibición de re-presentarse en fuera_de_tema",
   );
 });
 

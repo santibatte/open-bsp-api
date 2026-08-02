@@ -37,7 +37,7 @@ create table if not exists public.agent_respuestas_no_enviadas (
                                   -- este log al ciclo de vida de conversations
   mensaje_paciente text not null,
   tipo_declarado   text not null
-    check (tipo_declarado in ('catalogo', 'pedir_precision', 'faq', 'saludo_generico', 'silencio')),
+    check (tipo_declarado in ('catalogo', 'pedir_precision', 'faq', 'agendar', 'seguimiento_tratamiento', 'saludo_generico', 'fuera_de_tema', 'silencio')),
   mensaje_borrador text not null default '',  -- vacío cuando tipo = 'silencio'
   motivo           text not null,  -- el motivo que devolvió el juez, o
                                    -- 'silencio - contador >= 1' si no hubo juez
@@ -75,6 +75,21 @@ alter table public.agent_respuestas_no_enviadas
 alter table public.agent_respuestas_no_enviadas
   add constraint agent_respuestas_no_enviadas_tipo_declarado_check
   check (tipo_declarado in ('catalogo', 'pedir_precision', 'faq', 'saludo_generico', 'silencio'));
+
+-- ============================================================
+-- 1c. Migración 2026-08-02 (misma tarde) — agendar, seguimiento_tratamiento,
+--     fuera_de_tema
+-- ============================================================
+--
+-- Tres huecos reales encontrados probando en vivo con los 2 números de
+-- prueba (ver prompts.ts para el detalle). También idempotente.
+
+alter table public.agent_respuestas_no_enviadas
+  drop constraint if exists agent_respuestas_no_enviadas_tipo_declarado_check;
+
+alter table public.agent_respuestas_no_enviadas
+  add constraint agent_respuestas_no_enviadas_tipo_declarado_check
+  check (tipo_declarado in ('catalogo', 'pedir_precision', 'faq', 'agendar', 'seguimiento_tratamiento', 'saludo_generico', 'fuera_de_tema', 'silencio'));
 
 -- ============================================================
 -- 2. Contador atómico de preguntas fuera de tema
