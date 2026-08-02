@@ -325,6 +325,14 @@ Deno.serve(async (req) => {
     org.extra.welcome_message &&
     recentMessages.every((m) => m.direction !== "outgoing")
   ) {
+    // `agent_id` tiene que apuntar a un agente con `ai: true`, si no
+    // `pause_conversation_on_human_message` (trigger de Postgres) va a
+    // tratar este mensaje automático como si lo hubiera mandado un humano y
+    // va a pausar la conversación 12hs — dejando al agente de IA mudo justo
+    // después de saludar. Bug real encontrado 2026-08-02 probando el
+    // guardrail: el mensaje de bienvenida se mandaba con agent_id null.
+    const aiAgentId = agents.find((a) => a.ai)?.id ?? null;
+
     const outgoing: MessageInsert = {
       organization_id: conv.organization_id,
       conversation_id: conv.id,
@@ -332,6 +340,7 @@ Deno.serve(async (req) => {
       organization_address: conv.organization_address,
       contact_address: conv.contact_address,
       direction: "outgoing",
+      agent_id: aiAgentId,
       content: {
         version: "1",
         type: "text",
