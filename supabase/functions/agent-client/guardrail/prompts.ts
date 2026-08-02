@@ -60,7 +60,7 @@ import type { JSONSchema } from "./anthropic.ts";
  *                "mezclar precios" ni "varios tratamientos a la vez" (eso es
  *                para tratamientos DISTINTOS, no variantes de la misma
  *                familia).
- * v8 (pendiente — completar tras commit) — primera corrida completa del
+ * v8 (35813f3) — primera corrida completa del
  *                golden set (9/9 casos) contra v7 encontró dos problemas más
  *                (ver Incidente 8): (a) el juez confundía los montos de SEÑA
  *                de la FAQ operativa ($20.000/$50.000, fijos) con "precios de
