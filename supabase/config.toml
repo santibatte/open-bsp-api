@@ -99,3 +99,11 @@ entrypoint = "./functions/storage-gc/index.ts"
 verify_jwt = false
 import_map = "./functions/deno.json"
 entrypoint = "./functions/meta-conversions-api/index.ts"
+
+# Vampiresa Meli-specific: golden set de prueba del guardrail redactor/juez —
+# gate manual antes de dar por buena una recalibración de prompts. Ver el
+# header de guardrail-golden-set/index.ts.
+[functions.guardrail-golden-set]
+verify_jwt = false
+import_map = "./functions/deno.json"
+entrypoint = "./functions/guardrail-golden-set/index.ts"
