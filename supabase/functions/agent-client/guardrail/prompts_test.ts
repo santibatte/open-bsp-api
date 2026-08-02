@@ -195,7 +195,8 @@ Deno.test("el redactor permite recitar cuidados literales del catálogo", () => 
   const prompt = systemRedactor(CATALOGO_FALSO, 0);
 
   assert(
-    /EXCEPCIÓN — los cuidados SÍ se pueden dar/i.test(prompt),
+    /EXCEPCIÓN — los cuidados y las reacciones esperables SÍ se pueden dar/i
+      .test(prompt),
     "falta la excepción que permite citar cuidados previos/posteriores literales",
   );
 });

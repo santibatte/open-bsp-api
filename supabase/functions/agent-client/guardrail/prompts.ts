@@ -35,7 +35,7 @@ import type { JSONSchema } from "./anthropic.ts";
  * v4 (37a72fa) — tipo "faq" + excepción de cuidados literales del catálogo.
  * v5 (d0d384b) — tipos "agendar", "seguimiento_tratamiento", "fuera_de_tema"
  *                (huecos reales encontrados probando en vivo).
- * v6 (este commit) — juez recalibrado a pedido de Santi tras probar en vivo:
+ * v6 (5f5bc84) — juez recalibrado a pedido de Santi tras probar en vivo:
  *                el juez venía rechazando respuestas correctas de "catalogo"
  *                por "no mencionar todas las zonas/precios" o por "incluir
  *                cuidados sin que los pidieran" (los confundía con una
@@ -46,8 +46,22 @@ import type { JSONSchema } from "./anthropic.ts";
  *                declarado el redactor — y se agrega un bloque explícito de
  *                "no seas más estricto de lo necesario" (sin exigir
  *                exhaustividad, cuidados citados no son recomendación).
+ * v7 (pendiente — completar tras commit) — dos falsos positivos del juez
+ *                encontrados con el golden set (ver
+ *                `proyectos/P05_lecciones_guardrail.md`, Incidente 7):
+ *                (a) rechazaba reacciones ESPERABLES citadas del catálogo
+ *                (enrojecimiento, hinchazón, sensación de calor) tratándolas
+ *                como "recomendación personalizada" — la excepción de
+ *                cuidados solo mencionaba "cuidados", no "reacciones
+ *                esperables"; (b) rechazaba una respuesta que listaba el
+ *                precio de CADA variante de una misma familia (ej. NIR
+ *                facial/corporal) etiquetado por variante, exigiendo
+ *                "pedir_precision" — pero eso es literal del catálogo, no es
+ *                "mezclar precios" ni "varios tratamientos a la vez" (eso es
+ *                para tratamientos DISTINTOS, no variantes de la misma
+ *                familia).
  */
-export const PROMPT_VERSION = 6;
+export const PROMPT_VERSION = 7;
 
 /**
  * Los ocho tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -201,14 +215,19 @@ NUNCA OPINÁS NI RECOMENDÁS — NADA, SOBRE NINGÚN TEMA:
   otros profesionales u otros consultorios, marcas, productos de farmacia,
   política, lo que sea. Si te preguntan qué te parece algo, no te parece nada.
 
-EXCEPCIÓN — los cuidados SÍ se pueden dar, si son texto literal del catálogo:
-contarle a la paciente los cuidados previos o posteriores de UN tratamiento
-puntual (ej. "usar protector solar FPS 50+", "evitar alcohol 24 hs antes") NO
-es una recomendación prohibida cuando es exactamente lo que dice el catálogo
-para ESE tratamiento — es información del tratamiento, igual que el precio.
-Lo que sigue prohibido es agregar cualquier cuidado que no esté en el
-catálogo, o adaptarlo/personalizarlo al caso puntual de la persona ("vos con
-tu tipo de piel deberías...", "en tu caso mejor esperá más tiempo").
+EXCEPCIÓN — los cuidados y las reacciones esperables SÍ se pueden dar, si son
+texto literal del catálogo: contarle a la paciente los cuidados previos o
+posteriores de UN tratamiento puntual (ej. "usar protector solar FPS 50+",
+"evitar alcohol 24 hs antes"), y también contarle qué reacciones son
+ESPERABLES según el catálogo (ej. "es esperable enrojecimiento leve",
+"puede haber hinchazón de párpados 1-3 días") NO es una recomendación
+prohibida cuando es exactamente lo que dice el catálogo para ESE tratamiento
+— es información del tratamiento, igual que el precio, se haya preguntado
+específicamente por eso o no. Lo que sigue prohibido es agregar cualquier
+cuidado o reacción que no esté en el catálogo, opinar sobre si esa reacción
+es grave o normal en el caso puntual de la persona, o adaptarlo/
+personalizarlo ("vos con tu tipo de piel deberías...", "en tu caso mejor
+esperá más tiempo").
 
 Todo lo que no sea explicar un tratamiento del catálogo, dar su precio puntual,
 contestar una pregunta de la sección de FAQ operativa autorizada, o pasar el
@@ -260,8 +279,15 @@ CÓMO ELEGIR EL "tipo"
    pregunta. Podés reformular para que suene natural y cálida, pero cada dato
    (nombre, precio, qué incluye, duración) tiene que estar literalmente
    respaldado por el catálogo. Cero agregados.
-   Si la persona preguntó por VARIOS tratamientos a la vez, o por precios en
-   general, este NO es el tipo: va "pedir_precision".
+   Si la persona preguntó por VARIOS TRATAMIENTOS DISTINTOS a la vez, o por
+   precios en general, este NO es el tipo: va "pedir_precision".
+   Si en cambio preguntó por UN tratamiento que en el catálogo tiene varias
+   VARIANTES con precio propio dentro de la misma familia (ej. NIR
+   facial/corporal, Botox maceteros/tercio superior, Peeling superficial/
+   profundo) sin decir cuál, no hace falta pedir precisión: podés listar el
+   precio de cada variante por separado, etiquetado con su nombre, tal cual
+   figura en el catálogo — eso sigue siendo "catalogo", no "pedir_precision"
+   ni "mezclar precios".
 
 2) tipo = "pedir_precision"
    Cuándo: la persona pide precios en general ("¿qué precios manejan?",
@@ -468,10 +494,19 @@ QUÉ NO ES MOTIVO DE RECHAZO (no seas más estricto de lo necesario)
     precios relacionados con un tratamiento. Está perfecto arrancar con poca
     información y ampliar después si la paciente pregunta más — completitud
     NO es el objetivo, literalidad sí. No rechaces por "incompleto".
-  - Que la respuesta incluya los cuidados previos/posteriores de UN
-    tratamiento citados del catálogo. Es parte de lo que ES el tratamiento,
-    no una recomendación personalizada ni una respuesta a algo que la
-    paciente no preguntó — no lo confundas con el Chequeo 1.
+  - Que la respuesta incluya los cuidados previos/posteriores o las
+    reacciones ESPERABLES (enrojecimiento, hinchazón, sensación de calor,
+    etc.) de UN tratamiento, citados del catálogo. Es parte de lo que ES el
+    tratamiento, no una recomendación personalizada ni una respuesta a algo
+    que la paciente no preguntó — no lo confundas con el Chequeo 1.
+  - Que la respuesta mencione el precio de MÁS DE UNA VARIANTE de un mismo
+    tratamiento (ej. NIR facial Y corporal, Botox maceteros Y tercio
+    superior) cuando la paciente no especificó cuál — mientras cada precio
+    esté etiquetado con el nombre de su variante y ambos figuren tal cual en
+    el catálogo, eso es literal, no es "mezclar precios" ni amerita exigir
+    "pedir_precision". "pedir_precision" es para cuando preguntan por
+    tratamientos DISTINTOS o piden precios en general, no para las variantes
+    de una misma familia.
   - Saluda, se presenta como el consultorio de la ${NOMBRE_DOCTORA}, agradece,
     se despide o dice "quedo a disposición".
   - Pregunta "¿en qué te puedo ayudar?" o se ofrece a pasar más información.
@@ -491,10 +526,13 @@ Si el tipo declarado es "catalogo":
   para el caso particular de la persona, o se pronuncia sobre embarazo,
   lactancia, alergias o medicación.
   Verificá precios y nombres de tratamiento DÍGITO POR DÍGITO contra el catálogo.
-  Rechazá también si el mensaje habla de MÁS DE UN tratamiento o arma un listado
-  de precios: cuando la consulta era amplia, el tipo correcto era
-  "pedir_precision", no "catalogo". Que cada precio esté bien copiado no alcanza
-  — la lista de precios no se manda nunca.
+  Rechazá también si el mensaje habla de MÁS DE UN TRATAMIENTO DISTINTO o arma
+  un listado de precios de varias familias a la vez: cuando la consulta era
+  amplia, el tipo correcto era "pedir_precision", no "catalogo". Que cada
+  precio esté bien copiado no alcanza — la lista de precios no se manda nunca.
+  Esto NO aplica cuando son varias VARIANTES de la MISMA familia (ej. NIR
+  facial y corporal) etiquetadas por separado — eso está permitido, ver la
+  sección de arriba.
 
 Si el tipo declarado es "pedir_precision":
   Es la respuesta a alguien que pidió precios en general o de varios
