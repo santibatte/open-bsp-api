@@ -278,10 +278,10 @@ Deno.test("el juez tiene una regla para cada tipo que puede llegarle", () => {
 Deno.test("el juez autoriza explícitamente el mail Y el link de Calendly", () => {
   const prompt = systemJuez(CATALOGO_FALSO, 0);
 
-  const inicio = prompt.indexOf("EXCEPCIONES AUTORIZADAS");
-  const fin = prompt.indexOf("PROHIBIDO SIEMPRE");
+  const inicio = prompt.indexOf("LOS DOS CHEQUEOS QUE IMPORTAN");
+  const fin = prompt.indexOf("QUÉ NO ES MOTIVO DE RECHAZO");
 
-  assert(inicio > 0 && fin > inicio, "falta el bloque de excepciones");
+  assert(inicio > 0 && fin > inicio, "falta el bloque de los dos chequeos");
 
   const bloque = prompt.slice(inicio, fin);
 
@@ -294,30 +294,52 @@ Deno.test("el juez autoriza explícitamente el mail Y el link de Calendly", () =
   );
 });
 
-Deno.test("el juez bloquea opiniones y recomendaciones de cualquier tipo", () => {
+Deno.test("el juez bloquea invención (diagnósticos, comparaciones, promesas de resultado)", () => {
   const prompt = systemJuez(CATALOGO_FALSO, 0);
 
-  const inicio = prompt.indexOf("PROHIBIDO SIEMPRE");
-  const fin = prompt.indexOf("QUÉ NO ES MOTIVO DE RECHAZO");
+  const inicio = prompt.indexOf("CHEQUEO 1");
+  const fin = prompt.indexOf("CHEQUEO 2");
 
-  assert(inicio > 0 && fin > inicio, "falta el bloque PROHIBIDO SIEMPRE");
+  assert(inicio > 0 && fin > inicio, "falta el bloque CHEQUEO 1");
 
   const bloque = prompt.slice(inicio, fin);
 
   for (
     const frase of [
-      "Una opinión médica de cualquier clase",
-      "Una recomendación o un consejo de cualquier tipo",
-      "Un juicio de valor sobre un tratamiento",
-      "formas de pago no listadas",
+      "diagnósticos",
+      "promesas de resultado",
     ]
   ) {
     assert(bloque.includes(frase), `falta la prohibición: "${frase}"`);
   }
 
   assert(
-    /promesa, expectativa o insinuación de resultado/i.test(bloque),
-    "falta la prohibición de prometer resultados",
+    /dígito por dígito/i.test(bloque),
+    "falta la verificación de precios dígito por dígito",
+  );
+  assert(
+    /comparaciones o\s+juicios de valor entre tratamientos/i.test(bloque),
+    "falta la prohibición de comparar o juzgar tratamientos",
+  );
+});
+
+Deno.test("el juez fuerza seguimiento_tratamiento sin importar qué tipo declaró el redactor", () => {
+  const prompt = systemJuez(CATALOGO_FALSO, 0);
+
+  const inicio = prompt.indexOf("CHEQUEO 2");
+  const fin = prompt.indexOf("QUÉ NO ES MOTIVO DE RECHAZO");
+
+  assert(inicio > 0 && fin > inicio, "falta el bloque CHEQUEO 2");
+
+  const bloque = prompt.slice(inicio, fin);
+
+  assert(
+    bloque.includes(MAIL_CONSULTAS),
+    "CHEQUEO 2 tiene que derivar al mail de la doctora",
+  );
+  assert(
+    /INDEPENDIENTE del tipo que haya declarado el redactor/i.test(bloque),
+    "falta la aclaración de que este chequeo aplica sin importar el tipo declarado",
   );
 });
 
@@ -334,8 +356,8 @@ Deno.test("el juez deja lugar explícito a la cordialidad", () => {
   );
 
   assert(
-    /La calidez NO es el problema/i.test(bloque),
-    "falta la aclaración de que la calidez no se rechaza",
+    /tono buscado/i.test(bloque),
+    "falta la aclaración de que la calidez/cordialidad no se rechaza",
   );
   assert(
     /poco informativo/i.test(bloque),
@@ -408,17 +430,29 @@ Deno.test("el juez tiene una regla propia para faq que exige literalidad", () =>
   );
 });
 
-Deno.test("el juez autoriza explícitamente los cuidados literales del catálogo", () => {
+Deno.test("el juez no exige exhaustividad ni confunde cuidados con recomendación", () => {
   const prompt = systemJuez(CATALOGO_FALSO, 0);
 
-  const inicio = prompt.indexOf("EXCEPCIONES AUTORIZADAS");
-  const fin = prompt.indexOf("PROHIBIDO SIEMPRE");
+  const inicio = prompt.indexOf("QUÉ NO ES MOTIVO DE RECHAZO");
 
-  const bloque = prompt.slice(inicio, fin);
+  assert(inicio > 0, "falta el bloque de qué no es motivo de rechazo");
+
+  const bloque = prompt.slice(
+    inicio,
+    prompt.indexOf('Si el tipo declarado es "catalogo"'),
+  );
 
   assert(
-    /cuidados previos\/posteriores/i.test(bloque),
-    "falta la excepción de cuidados literales en el bloque de excepciones del juez",
+    /no mencione TODAS las variantes/i.test(bloque),
+    "falta la aclaración de que no hace falta ser exhaustivo",
+  );
+  assert(
+    /no rechaces por "incompleto"/i.test(bloque),
+    "falta la instrucción explícita de no rechazar por incompleto",
+  );
+  assert(
+    /no una recomendación personalizada/i.test(bloque),
+    "falta la aclaración de que los cuidados no son una recomendación",
   );
 });
 

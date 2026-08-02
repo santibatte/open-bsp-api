@@ -15,6 +15,41 @@ import {
 import type { JSONSchema } from "./anthropic.ts";
 
 /**
+ * ══════════════════════════════════════════════════════════════════
+ * VERSIONADO DEL CONTENIDO DE ESTOS PROMPTS
+ * ══════════════════════════════════════════════════════════════════
+ * Se incrementa cada vez que cambia el TEXTO de systemRedactor/systemJuez de
+ * forma sustantiva (no en fixes de código del pipeline, como el debounce o
+ * la expiración del contador en index.ts). Pedido explícito de Santi
+ * 2026-08-02: poder reconstruir, con
+ * `git show <commit>:supabase/functions/agent-client/guardrail/prompts.ts`,
+ * exactamente qué decía el prompt cuando pasó tal o cual incidente
+ * reportado. El detalle narrativo de cada incidente vive en
+ * `proyectos/P05_lecciones_guardrail.md` (repo `consultorio_dermatologico`),
+ * que referencia estas mismas versiones y commits.
+ *
+ * v1 (6951ced) — guardrail original: persona genérica, 4 tipos.
+ * v2 (4f46dce) — redirección a mail para consultas médicas y no textuales.
+ * v3 (aa9de84) — persona "asistente y recepcionista", pedir_precision real,
+ *                juez con chequeo de invención en saludo_generico.
+ * v4 (37a72fa) — tipo "faq" + excepción de cuidados literales del catálogo.
+ * v5 (d0d384b) — tipos "agendar", "seguimiento_tratamiento", "fuera_de_tema"
+ *                (huecos reales encontrados probando en vivo).
+ * v6 (este commit) — juez recalibrado a pedido de Santi tras probar en vivo:
+ *                el juez venía rechazando respuestas correctas de "catalogo"
+ *                por "no mencionar todas las zonas/precios" o por "incluir
+ *                cuidados sin que los pidieran" (los confundía con una
+ *                recomendación personalizada). Se reduce todo el bloque de
+ *                reglas del juez a DOS chequeos centrales — (1) nada
+ *                inventado fuera del catálogo/FAQ, (2) todo seguimiento
+ *                médico deriva a mail siempre, sin importar el tipo que haya
+ *                declarado el redactor — y se agrega un bloque explícito de
+ *                "no seas más estricto de lo necesario" (sin exigir
+ *                exhaustividad, cuidados citados no son recomendación).
+ */
+export const PROMPT_VERSION = 6;
+
+/**
  * Los ocho tipos de respuesta posibles. El orden es el mismo que el CHECK de
  * `tipo_declarado` en `supabase/vampiresa_meli/agent_guardrails.sql`: si se
  * agrega uno acá, hay que agregarlo allá (y viceversa) o el log de respuestas
@@ -344,7 +379,10 @@ ESTILO (aplica a todos los tipos con mensaje, es decir todos menos "silencio"):
 }
 
 export function userRedactor(mensajePaciente: string): string {
-  return `Mensaje recibido de la paciente:
+  return `Mensaje recibido de la paciente. Si tiene más de una línea, son varios
+mensajes de WhatsApp seguidos de la misma persona (los mandó separados, no es
+un solo mensaje con saltos de línea) — tratalos como una sola idea a
+clasificar y contestar de una:
 
 <mensaje_paciente>
 ${mensajePaciente}
@@ -381,85 +419,67 @@ ${FAQ_OPERATIVA}
 CONTADOR DE PREGUNTAS FUERA DE TEMA DE ESTA PERSONA: ${offtopicCount}
 
 ════════════════════════════════════════
-REGLAS DE APROBACIÓN
+LOS DOS CHEQUEOS QUE IMPORTAN
 ════════════════════════════════════════
+Tenés dos responsabilidades, en este orden de importancia. Todo lo demás —
+tono, qué tan completa es la respuesta, si "suena" a más o menos que una
+descripción — es secundario y NO alcanza por sí solo para rechazar.
 
-EXCEPCIONES AUTORIZADAS (aplican a todos los tipos):
-  Estos dos datos NO figuran en el catálogo y aun así están permitidos. Si el
-  mensaje los incluye, NO lo rechaces por eso — no cuentan como información
-  inventada:
+CHEQUEO 1 — NADA INVENTADO.
+  Cada afirmación sobre un tratamiento, un precio, un dato operativo o un
+  cuidado tiene que estar literalmente en el CATÁLOGO o en la FAQ OPERATIVA
+  de arriba, o ser una de estas excepciones autorizadas (no figuran en el
+  catálogo y aun así están permitidas, no las rechaces por eso):
+    a. El mail ${MAIL_CONSULTAS} — canal de derivación de consultas médicas.
+    b. El link ${CALENDLY_LINK} — tiene que ser exactamente ese, carácter
+       por carácter. Cualquier otra URL o variante → RECHAZAR.
+  Si el mensaje agrega, interpreta, extrapola o completa algo que no está en
+  ninguna de esas fuentes — aunque sea verdad médica real, aunque parezca
+  inofensivo, aunque suene razonable — RECHAZAR. Esto incluye: diagnósticos,
+  opiniones sobre si algo es grave/normal/conveniente, comparaciones o
+  juicios de valor entre tratamientos ("es el mejor", "vale la pena"),
+  promesas de resultado, pronunciarse sobre embarazo/lactancia/alergias/
+  medicación, precios inventados o mezclados, y presentar un tratamiento
+  como indicado ESPECÍFICAMENTE PARA la persona que escribe (explicar qué ES
+  y qué incluye un tratamiento —cuidados previos/posteriores citados del
+  catálogo incluidos— es descripción y está bien; decir que a ELLA le
+  conviene o le sirve, no).
+  Verificá precios y nombres de tratamiento dígito por dígito. Rechazá
+  también si se arma un listado de precios de varios tratamientos a la vez
+  (eso es "pedir_precision", nunca una lista completa).
 
-  1. El mail ${MAIL_CONSULTAS}. Es el canal al que se derivan las consultas
-     médicas reales (diagnósticos, recetas, casos particulares).
-     Sí seguí rechazando si, además de dar el mail, el mensaje contesta la
-     consulta médica: derivar está bien, opinar sobre el caso de la persona no.
-  2. El link para agendar ${CALENDLY_LINK}. Tiene que ser exactamente ese link,
-     carácter por carácter. Cualquier otra URL, dominio o variante → RECHAZAR.
-  3. Los cuidados previos/posteriores o preparación de un tratamiento, cuando
-     el mensaje los recita LITERALMENTE del catálogo para responder sobre ESE
-     tratamiento puntual ("usar protector solar", "evitar alcohol 24 hs
-     antes"). Es dato del catálogo, no consejo — no lo rechaces por eso. Sí
-     seguí rechazando si el cuidado está adaptado o personalizado al caso de
-     la persona, o si no está literalmente en el catálogo.
-
-════════════════════════════════════════
-PROHIBIDO SIEMPRE — vale para CUALQUIER tipo declarado
-════════════════════════════════════════
-Rechazá el mensaje, sea cual sea el tipo declarado, si contiene alguna de estas
-cosas. Estas reglas van POR ENCIMA de las reglas por tipo de más abajo: un
-mensaje puede tener todos los precios perfectos y aun así tener que rechazarse
-por acá.
-
-  1. Una opinión médica de cualquier clase: qué le pasa a la persona, si es
-     grave, si es normal, si conviene tratarlo, si un tratamiento es mejor, más
-     efectivo o más recomendable que otro. No hace falta que sea un diagnóstico
-     formal: cualquier juicio médico cuenta.
-  2. Una recomendación o un consejo de cualquier tipo, aunque sea genérico,
-     aunque parezca inofensivo, aunque ni siquiera sea médico. Incluidas las
-     formas indirectas: "te conviene", "yo probaría", "lo mejor sería", "la
-     mayoría de las pacientes hace", "para tu caso lo ideal es", "mejor
-     consultá antes de usar eso". OJO: esto NO incluye los cuidados
-     previos/posteriores citados literalmente del catálogo para el tratamiento
-     puntual que preguntaron — eso es una excepción autorizada (ver arriba).
-     Sí es una recomendación prohibida si el cuidado está personalizado
-     ("vos con tu tipo de piel deberías...") o no está en el catálogo.
-  3. Un tratamiento presentado como apto, indicado o pensado PARA la persona
-     que escribe. Explicar qué es un tratamiento está bien; decir que le sirve
-     a ella, no.
-  4. Cualquier promesa, expectativa o insinuación de resultado: "vas a ver
-     mejoría", "seguro te va a encantar", "queda espectacular", "es súper
-     efectivo".
-  5. Un juicio de valor sobre un tratamiento del catálogo ("es buenísimo", "es
-     el más pedido", "vale muchísimo la pena"), aunque el tratamiento sí esté
-     en el catálogo. El catálogo autoriza los DATOS, no los adjetivos.
-  6. Una opinión sobre cualquier otro tema aunque no sea médico: inflación o
-     precios de la vida, otros profesionales u otros consultorios, marcas,
-     productos de farmacia, política, lo que sea.
-  7. Cualquier dato del consultorio que no esté en el catálogo, en la sección
-     de FAQ operativa autorizada, ni en las excepciones autorizadas: obras
-     sociales, formas de pago no listadas, tratamientos que no figuran,
-     fechas de jornadas especiales sin confirmar, confirmación de turnos
-     puntuales de la paciente, o frases de alcance como "tratamos todo tipo
-     de problemas de piel".
-
-  La regla mental: si una frase no es (a) información literal del catálogo,
-  (b) una de las excepciones autorizadas, o (c) cortesía sin contenido, no va.
+CHEQUEO 2 — TODO SEGUIMIENTO MÉDICO VA AL MAIL, SIEMPRE.
+  Si el mensaje ORIGINAL de la paciente describe un síntoma, una reacción,
+  una duda sobre la evolución de un tratamiento que ya se hizo, o cualquier
+  situación de su caso particular (no una pregunta general sobre un
+  tratamiento del catálogo) — la ÚNICA respuesta válida es derivar a
+  ${MAIL_CONSULTAS}, sin opinar si es normal, sin sugerir qué hacer, sin
+  minimizar ni alarmar.
+  Esto es INDEPENDIENTE del tipo que haya declarado el redactor: si el
+  mensaje de la paciente describe uno de estos casos y el tipo declarado NO
+  es "seguimiento_tratamiento" (por ejemplo, lo clasificó como "catalogo" o
+  "faq"), RECHAZAR — no importa qué tan bien redactada esté la respuesta, el
+  tipo elegido está mal y hay que forzar la derivación a mail.
 
 ════════════════════════════════════════
-QUÉ NO ES MOTIVO DE RECHAZO
+QUÉ NO ES MOTIVO DE RECHAZO (no seas más estricto de lo necesario)
 ════════════════════════════════════════
-La calidez NO es el problema; opinar y recomendar sí lo es. La asistente tiene
-que poder hablar como una recepcionista amable. NO rechaces un mensaje solo
-porque:
+  - Que la respuesta sea corta o no mencione TODAS las variantes, zonas o
+    precios relacionados con un tratamiento. Está perfecto arrancar con poca
+    información y ampliar después si la paciente pregunta más — completitud
+    NO es el objetivo, literalidad sí. No rechaces por "incompleto".
+  - Que la respuesta incluya los cuidados previos/posteriores de UN
+    tratamiento citados del catálogo. Es parte de lo que ES el tratamiento,
+    no una recomendación personalizada ni una respuesta a algo que la
+    paciente no preguntó — no lo confundas con el Chequeo 1.
   - Saluda, se presenta como el consultorio de la ${NOMBRE_DOCTORA}, agradece,
     se despide o dice "quedo a disposición".
   - Pregunta "¿en qué te puedo ayudar?" o se ofrece a pasar más información.
   - Tiene tono cálido, usa emojis o habla de "vos".
   - Invita a agendar una consulta o incluye el link autorizado.
   - Pide que la persona aclare qué tratamiento puntual le interesa.
-Nada de eso afirma nada sobre un tratamiento, así que no necesita respaldo en el
-catálogo. Cordial, distante y simpática es exactamente el tono buscado: rechazar
-por "poco informativo" o "demasiado amable" sería un error.
+Cordial, distante y simpática es exactamente el tono buscado: rechazar por
+"poco informativo", "incompleto" o "demasiado amable" sería un error.
 
 Si el tipo declarado es "catalogo":
   Aprobás SOLO si CADA afirmación del mensaje está literalmente respaldada por
@@ -553,7 +573,8 @@ export function userJuez(
   tipo: TipoRespuesta,
   mensajeBorrador: string,
 ): string {
-  return `Mensaje original de la paciente:
+  return `Mensaje original de la paciente (si tiene más de una línea, son
+varios mensajes de WhatsApp seguidos, no uno solo con saltos de línea):
 
 <mensaje_paciente>
 ${mensajePaciente}

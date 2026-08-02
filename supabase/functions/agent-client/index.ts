@@ -102,6 +102,49 @@ function getNewestIncomingMessage(
   return sortedMessages[0];
 }
 
+/**
+ * Junta el texto de todos los mensajes ENTRANTES consecutivos que terminan en
+ * `newestMessage`, sin ningún mensaje saliente en el medio — cubre el caso de
+ * alguien mandando la misma idea en varios mensajes seguidos ("Quiero saber
+ * del botox" + "y cuánto sale"). Solo tiene sentido cuando `messages` ya viene
+ * en orden cronológico ascendente.
+ *
+ * Antes el guardrail solo miraba el texto del último mensaje de la tanda, así
+ * que perdía el contexto de los anteriores (encontrado 2026-08-02 probando en
+ * vivo: "hola" + "que tal" mandados seguidos hacían que el redactor solo viera
+ * "que tal", sin problema porque ambos eran equivalentes, pero con contenido
+ * distinto se hubiera perdido información real).
+ *
+ * Mensajes no textuales dentro de la tanda no se concatenan (no hay texto que
+ * sumar de una foto) pero tampoco cortan la racha.
+ */
+function getIncomingBurstText(
+  messages: MessageRow[],
+  newestMessage: MessageRow,
+): string {
+  const newestIndex = messages.findIndex((m) => m.id === newestMessage.id);
+
+  if (newestIndex === -1) {
+    return newestMessage.content.type === "text"
+      ? newestMessage.content.text
+      : "";
+  }
+
+  const textos: string[] = [];
+
+  for (let i = newestIndex; i >= 0; i--) {
+    const mensaje = messages[i];
+
+    if (mensaje.direction !== "incoming") break;
+
+    if (mensaje.content.type === "text" && mensaje.content.text.trim()) {
+      textos.unshift(mensaje.content.text.trim());
+    }
+  }
+
+  return textos.join("\n");
+}
+
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 Deno.serve(async (req) => {
@@ -441,8 +484,11 @@ Deno.serve(async (req) => {
   if (agent.extra?.guardrail) {
     const incomingContent = newestMessage.content;
 
+    // Si el último mensaje es texto, se junta con los textuales anteriores de
+    // la misma tanda (ver getIncomingBurstText) para no perder contexto
+    // cuando la paciente escribe la idea repartida en varios mensajes.
     const mensajePaciente = incomingContent.type === "text"
-      ? incomingContent.text
+      ? getIncomingBurstText(messages, newestMessage)
       : "";
 
     // Un texto en blanco se trata como no textual: el guardrail responde con la
