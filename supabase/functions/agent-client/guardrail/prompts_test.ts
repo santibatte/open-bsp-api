@@ -16,7 +16,12 @@
 
 import { assert, assertEquals } from "jsr:@std/assert@1";
 
-import { CALENDLY_LINK, MAIL_CONSULTAS, NOMBRE_DOCTORA } from "./catalogo.ts";
+import {
+  CALENDLY_LINK,
+  FAQ_OPERATIVA,
+  MAIL_CONSULTAS,
+  NOMBRE_DOCTORA,
+} from "./catalogo.ts";
 import {
   SCHEMA_JUEZ,
   SCHEMA_REDACTOR,
@@ -74,7 +79,7 @@ Deno.test("el schema del juez sigue siendo booleano + motivo obligatorios", () =
 
 // ════════════════════ Prompt del REDACTOR ════════════════════
 
-Deno.test("el redactor documenta los cuatro tipos en 'CÓMO ELEGIR EL tipo'", () => {
+Deno.test("el redactor documenta los cinco tipos en 'CÓMO ELEGIR EL tipo'", () => {
   const prompt = systemRedactor(CATALOGO_FALSO, 0);
 
   const seccion = prompt.slice(prompt.indexOf('CÓMO ELEGIR EL "tipo"'));
@@ -145,7 +150,7 @@ Deno.test("pedir_precision le prohíbe al redactor cualquier cifra", () => {
   const prompt = systemRedactor(CATALOGO_FALSO, 0);
 
   const inicio = prompt.indexOf('tipo = "pedir_precision"');
-  const fin = prompt.indexOf('tipo = "saludo_generico"');
+  const fin = prompt.indexOf('tipo = "faq"');
 
   assert(
     inicio > 0 && fin > inicio,
@@ -162,6 +167,36 @@ Deno.test("pedir_precision le prohíbe al redactor cualquier cifra", () => {
   assert(
     /NO es una pregunta fuera de tema/i.test(bloque),
     "falta la aclaración de que pedir_precision no gasta el saludo de cortesía",
+  );
+});
+
+Deno.test("el redactor inyecta la FAQ operativa y explica el tipo faq", () => {
+  const prompt = systemRedactor(CATALOGO_FALSO, 0);
+
+  assert(
+    prompt.includes(FAQ_OPERATIVA),
+    "no se inyectó la sección de FAQ operativa autorizada",
+  );
+
+  const inicio = prompt.indexOf('tipo = "faq"');
+  const fin = prompt.indexOf('tipo = "saludo_generico"');
+
+  assert(inicio > 0 && fin > inicio, "no se encontró el bloque faq");
+
+  const bloque = prompt.slice(inicio, fin);
+
+  assert(
+    /esto NO es "faq"/i.test(bloque),
+    "falta la aclaración de que el estado de un turno puntual no es faq",
+  );
+});
+
+Deno.test("el redactor permite recitar cuidados literales del catálogo", () => {
+  const prompt = systemRedactor(CATALOGO_FALSO, 0);
+
+  assert(
+    /EXCEPCIÓN — los cuidados SÍ se pueden dar/i.test(prompt),
+    "falta la excepción que permite citar cuidados previos/posteriores literales",
   );
 });
 
@@ -214,7 +249,7 @@ Deno.test("el juez bloquea opiniones y recomendaciones de cualquier tipo", () =>
       "Una opinión médica de cualquier clase",
       "Una recomendación o un consejo de cualquier tipo",
       "Un juicio de valor sobre un tratamiento",
-      "horarios de atención",
+      "formas de pago no listadas",
     ]
   ) {
     assert(bloque.includes(frase), `falta la prohibición: "${frase}"`);
@@ -252,7 +287,7 @@ Deno.test("la regla de pedir_precision del juez es 'ninguna cifra'", () => {
   const prompt = systemJuez(CATALOGO_FALSO, 0);
 
   const inicio = prompt.indexOf('Si el tipo declarado es "pedir_precision"');
-  const fin = prompt.indexOf('Si el tipo declarado es "saludo_generico"');
+  const fin = prompt.indexOf('Si el tipo declarado es "faq"');
 
   assert(inicio > 0 && fin > inicio, "falta la regla de pedir_precision");
 
@@ -285,6 +320,45 @@ Deno.test("catalogo no puede convertirse en una lista de precios", () => {
   assert(
     bloque.includes("DÍGITO POR DÍGITO"),
     "se perdió la verificación de precios dígito por dígito",
+  );
+});
+
+Deno.test("el juez tiene una regla propia para faq que exige literalidad", () => {
+  const prompt = systemJuez(CATALOGO_FALSO, 0);
+
+  assert(
+    prompt.includes(FAQ_OPERATIVA),
+    "el juez no ve la sección de FAQ operativa autorizada",
+  );
+
+  const inicio = prompt.indexOf('Si el tipo declarado es "faq"');
+  const fin = prompt.indexOf('Si el tipo declarado es "saludo_generico"');
+
+  assert(inicio > 0 && fin > inicio, "falta la regla de faq");
+
+  const bloque = prompt.slice(inicio, fin);
+
+  assert(
+    /literalmente en la sección de FAQ\s+operativa/i.test(bloque),
+    "falta la exigencia de literalidad para faq",
+  );
+  assert(
+    /consultar Calendly/i.test(bloque),
+    "falta el bloqueo de confirmar turnos puntuales en el tipo faq",
+  );
+});
+
+Deno.test("el juez autoriza explícitamente los cuidados literales del catálogo", () => {
+  const prompt = systemJuez(CATALOGO_FALSO, 0);
+
+  const inicio = prompt.indexOf("EXCEPCIONES AUTORIZADAS");
+  const fin = prompt.indexOf("PROHIBIDO SIEMPRE");
+
+  const bloque = prompt.slice(inicio, fin);
+
+  assert(
+    /cuidados previos\/posteriores/i.test(bloque),
+    "falta la excepción de cuidados literales en el bloque de excepciones del juez",
   );
 });
 

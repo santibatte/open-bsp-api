@@ -5,9 +5,10 @@
 -- mismo patrón que setup.sql y meta_sends_log.sql. Se corre una sola vez a
 -- mano en el SQL editor de Supabase (proyecto `velvet-agent`).
 --
--- ⚠️ TODAVÍA NO EJECUTADO. Ver el reporte del patrón redactor/juez: la parte
--- TypeScript está bloqueada esperando una decisión de arquitectura, pero este
--- SQL es independiente de esa decisión y ya está listo.
+-- ✅ Ejecutado contra la base real (`velvet-agent`) el 2026-08-01. El bloque
+-- 3 de más abajo ("faq") se agregó 2026-08-02 y ES una migración sobre una
+-- tabla que ya existe — el `create table if not exists` de acá abajo no la
+-- vuelve a tocar, por eso el ALTER está separado y es idempotente.
 --
 -- Contiene las dos piezas de estado que el patrón de dos llamados (redactor +
 -- juez) necesita del lado de la base:
@@ -36,7 +37,7 @@ create table if not exists public.agent_respuestas_no_enviadas (
                                   -- este log al ciclo de vida de conversations
   mensaje_paciente text not null,
   tipo_declarado   text not null
-    check (tipo_declarado in ('catalogo', 'pedir_precision', 'saludo_generico', 'silencio')),
+    check (tipo_declarado in ('catalogo', 'pedir_precision', 'faq', 'saludo_generico', 'silencio')),
   mensaje_borrador text not null default '',  -- vacío cuando tipo = 'silencio'
   motivo           text not null,  -- el motivo que devolvió el juez, o
                                    -- 'silencio - contador >= 1' si no hubo juez
@@ -59,6 +60,21 @@ comment on table public.agent_respuestas_no_enviadas is
 -- service role key (que igual bypassea RLS) y solo lee Santi desde el SQL
 -- editor. Si en algún momento esta tabla se expone en la UI de open-bsp,
 -- HAY que habilitar RLS y agregar una policy por organization_id.
+
+-- ============================================================
+-- 1b. Migración 2026-08-02 — agregar tipo "faq" al CHECK
+-- ============================================================
+--
+-- La tabla de arriba ya existía en producción con el CHECK viejo (sin
+-- 'faq'), así que el `create table if not exists` no alcanza para
+-- actualizarla. Idempotente: correrlo de nuevo no rompe nada.
+
+alter table public.agent_respuestas_no_enviadas
+  drop constraint if exists agent_respuestas_no_enviadas_tipo_declarado_check;
+
+alter table public.agent_respuestas_no_enviadas
+  add constraint agent_respuestas_no_enviadas_tipo_declarado_check
+  check (tipo_declarado in ('catalogo', 'pedir_precision', 'faq', 'saludo_generico', 'silencio'));
 
 -- ============================================================
 -- 2. Contador atómico de preguntas fuera de tema
