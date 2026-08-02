@@ -46,7 +46,7 @@ import type { JSONSchema } from "./anthropic.ts";
  *                declarado el redactor — y se agrega un bloque explícito de
  *                "no seas más estricto de lo necesario" (sin exigir
  *                exhaustividad, cuidados citados no son recomendación).
- * v7 (pendiente — completar tras commit) — dos falsos positivos del juez
+ * v7 (ca304e4) — dos falsos positivos del juez
  *                encontrados con el golden set (ver
  *                `proyectos/P05_lecciones_guardrail.md`, Incidente 7):
  *                (a) rechazaba reacciones ESPERABLES citadas del catálogo
