@@ -142,6 +142,17 @@ async function cancelar(eventUuid: string, motivo: string) {
   return data;
 }
 
+async function estadoEvento(eventUuid: string) {
+  const r = await fetch(`${CALENDLY_API_BASE}/scheduled_events/${eventUuid}`, {
+    headers: headers(),
+  });
+  if (!r.ok) {
+    throw new Error(`scheduled_events/{uuid} ${r.status}: ${await r.text()}`);
+  }
+  const data = await r.json();
+  return data.resource.status;
+}
+
 async function invitees(eventUuid: string) {
   const r = await fetch(
     `${CALENDLY_API_BASE}/scheduled_events/${eventUuid}/invitees`,
@@ -157,6 +168,22 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
+
+  const checkUuid = new URL(req.url).searchParams.get("check");
+  if (checkUuid) {
+    try {
+      const status = await estadoEvento(checkUuid);
+      return Response.json({ event_uuid: checkUuid, status }, {
+        headers: corsHeaders,
+      });
+    } catch (err) {
+      return Response.json({ error: String(err) }, {
+        status: 500,
+        headers: corsHeaders,
+      });
+    }
+  }
+
   const pasos: Record<string, unknown> = {};
   try {
     const etUri = await eventTypeUri(
