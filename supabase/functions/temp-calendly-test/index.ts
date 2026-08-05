@@ -106,9 +106,15 @@ async function agendar(eventTypeUriStr: string, startTime: string) {
         email: EMAIL_PRUEBA,
         timezone: "America/Argentina/Buenos_Aires",
       },
+      event: {
+        location_configuration: {
+          kind: "physical",
+          location: "Uruguay 1061 4to 57, Recoleta, CABA",
+        },
+      },
       questions_and_answers: [
         {
-          question: "¿Cuál es tu número de WhatsApp? (ej: 1112345678)",
+          question: "Número de teléfono del invitado",
           answer: TEL_PRUEBA_WSP,
           position: 0,
         },
