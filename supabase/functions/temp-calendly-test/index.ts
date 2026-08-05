@@ -43,8 +43,17 @@ async function eventTypeUri(nombre: string): Promise<string> {
   );
   if (!r.ok) throw new Error(`event_types ${r.status}: ${await r.text()}`);
   const data = await r.json();
+  const nombres = data.collection.map((e: { name: string; active: boolean }) =>
+    `${e.name} (active=${e.active})`
+  );
   const et = data.collection.find((e: { name: string }) => e.name === nombre);
-  if (!et) throw new Error(`No se encontró event type '${nombre}'`);
+  if (!et) {
+    throw new Error(
+      `No se encontró event type '${nombre}'. Encontrados: ${
+        JSON.stringify(nombres)
+      }`,
+    );
+  }
   return et.uri;
 }
 
