@@ -107,11 +107,3 @@ entrypoint = "./functions/meta-conversions-api/index.ts"
 verify_jwt = false
 import_map = "./functions/deno.json"
 entrypoint = "./functions/guardrail-golden-set/index.ts"
-
-# TEMPORAL — ver supabase/functions/temp-calendly-test/index.ts. Borrar esta
-# función (código + esta entrada) apenas termine la prueba de Calendly del
-# 2026-08-05.
-[functions.temp-calendly-test]
-verify_jwt = false
-import_map = "./functions/deno.json"
-entrypoint = "./functions/temp-calendly-test/index.ts"
