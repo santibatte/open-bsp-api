@@ -98,6 +98,7 @@ async function agendar(eventTypeUriStr: string, startTime: string) {
         {
           question: "¿Cuál es tu número de WhatsApp? (ej: 1112345678)",
           answer: TEL_PRUEBA_WSP,
+          position: 0,
         },
       ],
     }),
