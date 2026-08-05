@@ -57,6 +57,18 @@ async function eventTypeUri(nombre: string): Promise<string> {
   return et.uri;
 }
 
+async function eventTypeDetalle(eventTypeUriStr: string) {
+  const uuid = eventTypeUriStr.split("/").pop();
+  const r = await fetch(`${CALENDLY_API_BASE}/event_types/${uuid}`, {
+    headers: headers(),
+  });
+  if (!r.ok) {
+    throw new Error(`event_types/{uuid} ${r.status}: ${await r.text()}`);
+  }
+  const data = await r.json();
+  return data.resource;
+}
+
 async function primerHorarioLibre(eventTypeUriStr: string): Promise<string> {
   const ahora = new Date();
   for (let dia = 1; dia <= 30; dia += 6) {
@@ -147,6 +159,7 @@ Deno.serve(async (req) => {
       "Turno Dermatología - Dra. Melisa Altavista",
     );
     pasos.event_type_uri = etUri;
+    pasos.event_type_detalle = await eventTypeDetalle(etUri);
 
     const startTime = await primerHorarioLibre(etUri);
     pasos.slot_elegido = startTime;
