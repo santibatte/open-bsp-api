@@ -77,7 +77,7 @@ import type { JSONSchema } from "./anthropic.ts";
  *                literal ya nombrado en el prompt) — queda registrado como
  *                inconsistencia conocida del modelo, no se persigue más por
  *                ahora (ver Incidente 8).
- * v9 (pendiente de hash) — RELAJACIÓN deliberada del juez, pedida por Santi
+ * v9 (89551f6) — RELAJACIÓN deliberada del juez, pedida por Santi
  *                2026-08-05 tras ver que el juez le rechazó una respuesta de
  *                Botox maceteros/tercio superior que el propio prompt v8 ya
  *                autorizaba explícitamente (la inconsistencia de Incidente 8,
