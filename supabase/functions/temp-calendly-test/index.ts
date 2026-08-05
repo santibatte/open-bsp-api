@@ -142,7 +142,9 @@ Deno.serve(async (req) => {
   }
   const pasos: Record<string, unknown> = {};
   try {
-    const etUri = await eventTypeUri("Consulta");
+    const etUri = await eventTypeUri(
+      "Turno Dermatología - Dra. Melisa Altavista",
+    );
     pasos.event_type_uri = etUri;
 
     const startTime = await primerHorarioLibre(etUri);
