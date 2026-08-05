@@ -263,19 +263,6 @@ Deno.test("fuera_de_tema no repite la presentación del consultorio", () => {
 
 // ════════════════════ Prompt del JUEZ ════════════════════
 
-Deno.test("el juez tiene una regla para cada tipo que puede llegarle", () => {
-  const prompt = systemJuez(CATALOGO_FALSO, 0);
-
-  // 'silencio' nunca llega al juez: index.ts corta antes (no hay nada que
-  // aprobar). Todos los demás tipos sí, y todos necesitan regla propia.
-  for (const tipo of TIPOS_RESPUESTA.filter((t) => t !== "silencio")) {
-    assert(
-      prompt.includes(`Si el tipo declarado es "${tipo}"`),
-      `el juez no tiene ninguna regla para el tipo '${tipo}'`,
-    );
-  }
-});
-
 Deno.test("el juez autoriza explícitamente el mail Y el link de Calendly", () => {
   const prompt = systemJuez(CATALOGO_FALSO, 0);
 
@@ -322,6 +309,11 @@ Deno.test("el juez bloquea invención (diagnósticos, comparaciones, promesas de
     /comparaciones o\s+juicios de valor entre tratamientos/i.test(bloque),
     "falta la prohibición de comparar o juzgar tratamientos",
   );
+  assert(
+    /listado de precios de varios tratamientos a la vez/i.test(bloque),
+    "falta la prohibición de armar una lista completa de precios (v9: es la " +
+      "única protección real contra pedir/filtrar el catálogo entero de a poco)",
+  );
 });
 
 Deno.test("el juez fuerza seguimiento_tratamiento sin importar qué tipo declaró el redactor", () => {
@@ -353,7 +345,7 @@ Deno.test("el juez deja lugar explícito a la cordialidad", () => {
 
   const bloque = prompt.slice(
     inicio,
-    prompt.indexOf('Si el tipo declarado es "catalogo"'),
+    prompt.indexOf("No hay reglas adicionales por tipo"),
   );
 
   assert(
@@ -366,68 +358,12 @@ Deno.test("el juez deja lugar explícito a la cordialidad", () => {
   );
 });
 
-Deno.test("la regla de pedir_precision del juez es 'ninguna cifra'", () => {
-  const prompt = systemJuez(CATALOGO_FALSO, 0);
-
-  const inicio = prompt.indexOf('Si el tipo declarado es "pedir_precision"');
-  const fin = prompt.indexOf('Si el tipo declarado es "faq"');
-
-  assert(inicio > 0 && fin > inicio, "falta la regla de pedir_precision");
-
-  const bloque = prompt.slice(inicio, fin);
-
-  assert(
-    /RECHAZAR si aparece CUALQUIER cifra de\s+dinero/i.test(bloque),
-    "el chequeo central de pedir_precision (ninguna cifra) no está",
-  );
-  assert(
-    /SIN cifras al lado está permitido/i.test(bloque),
-    "falta la aclaración de que nombrar tratamientos sin precio sí se puede",
-  );
-});
-
-Deno.test("catalogo no puede convertirse en una lista de precios", () => {
-  const prompt = systemJuez(CATALOGO_FALSO, 0);
-
-  const inicio = prompt.indexOf('Si el tipo declarado es "catalogo"');
-  const fin = prompt.indexOf('Si el tipo declarado es "pedir_precision"');
-
-  assert(inicio > 0 && fin > inicio, "falta la regla de catalogo");
-
-  const bloque = prompt.slice(inicio, fin);
-
-  assert(
-    /MÁS DE UN tratamiento/i.test(bloque),
-    "el juez no bloquea que 'catalogo' se use para responder con varios tratamientos",
-  );
-  assert(
-    bloque.includes("DÍGITO POR DÍGITO"),
-    "se perdió la verificación de precios dígito por dígito",
-  );
-});
-
-Deno.test("el juez tiene una regla propia para faq que exige literalidad", () => {
+Deno.test("el juez ve la sección de FAQ operativa autorizada", () => {
   const prompt = systemJuez(CATALOGO_FALSO, 0);
 
   assert(
     prompt.includes(FAQ_OPERATIVA),
     "el juez no ve la sección de FAQ operativa autorizada",
-  );
-
-  const inicio = prompt.indexOf('Si el tipo declarado es "faq"');
-  const fin = prompt.indexOf('Si el tipo declarado es "saludo_generico"');
-
-  assert(inicio > 0 && fin > inicio, "falta la regla de faq");
-
-  const bloque = prompt.slice(inicio, fin);
-
-  assert(
-    /literalmente en la sección de FAQ\s+operativa/i.test(bloque),
-    "falta la exigencia de literalidad para faq",
-  );
-  assert(
-    /consultar Calendly/i.test(bloque),
-    "falta el bloqueo de confirmar turnos puntuales en el tipo faq",
   );
 });
 
@@ -440,7 +376,7 @@ Deno.test("el juez no exige exhaustividad ni confunde cuidados con recomendació
 
   const bloque = prompt.slice(
     inicio,
-    prompt.indexOf('Si el tipo declarado es "catalogo"'),
+    prompt.indexOf("No hay reglas adicionales por tipo"),
   );
 
   assert(
@@ -457,74 +393,22 @@ Deno.test("el juez no exige exhaustividad ni confunde cuidados con recomendació
   );
 });
 
-Deno.test("el juez aprueba seguimiento_tratamiento sin mirar el contador", () => {
-  const prompt = systemJuez(CATALOGO_FALSO, 5);
-
-  const inicio = prompt.indexOf(
-    'Si el tipo declarado es "seguimiento_tratamiento"',
-  );
-  const fin = prompt.indexOf('Si el tipo declarado es "saludo_generico"');
-
-  assert(
-    inicio > 0 && fin > inicio,
-    "falta la regla de seguimiento_tratamiento",
-  );
-
-  const bloque = prompt.slice(inicio, fin);
-
-  assert(
-    /SIN IMPORTAR el contador/i.test(bloque),
-    "seguimiento_tratamiento no debería depender del contador",
-  );
-});
-
-Deno.test("el juez exige contador>=1 para fuera_de_tema y prohíbe re-presentarse", () => {
+Deno.test("v9: el juez ya no tiene reglas propias por tipo declarado (relajación deliberada)", () => {
   const prompt = systemJuez(CATALOGO_FALSO, 0);
 
-  const inicio = prompt.indexOf('Si el tipo declarado es "fuera_de_tema"');
-
-  assert(inicio > 0, "falta la regla de fuera_de_tema");
-
-  const bloque = prompt.slice(
-    inicio,
-    prompt.indexOf('En "motivo" explicá'),
-  );
-
+  // Pedido explícito de Santi 2026-08-05: borrar todo el bloque "Si el tipo
+  // declarado es X" porque generaba rechazos de más (ver P05_lecciones_
+  // guardrail.md). El juez ya no valida el contador de fuera de tema ni
+  // exige nada específico por tipo — solo CHEQUEO 1 y CHEQUEO 2.
+  for (const tipo of TIPOS_RESPUESTA.filter((t) => t !== "silencio")) {
+    assert(
+      !prompt.includes(`Si el tipo declarado es "${tipo}"`),
+      `el juez todavía tiene una regla propia para '${tipo}' — se decidió sacarlas`,
+    );
+  }
   assert(
-    /contador de arriba es 1 o más/i.test(bloque),
-    "falta la condición de contador>=1 para fuera_de_tema",
-  );
-  assert(
-    /vuelve a presentar\s+ni saluda como si fuera la primera/i.test(
-      bloque,
-    ),
-    "falta la prohibición de re-presentarse en fuera_de_tema",
-  );
-});
-
-Deno.test("saludo_generico exige contador en 0 y nada inventado", () => {
-  const prompt = systemJuez(CATALOGO_FALSO, 2);
-
-  assert(
-    prompt.includes("FUERA DE TEMA DE ESTA PERSONA: 2"),
-    "el juez no ve el contador",
-  );
-
-  const bloque = prompt.slice(
-    prompt.indexOf('Si el tipo declarado es "saludo_generico"'),
-  );
-
-  assert(
-    bloque.includes("TRES condiciones"),
-    "el juez sigue con dos condiciones",
-  );
-  assert(
-    /El contador de arriba es exactamente 0/.test(bloque),
-    "falta el backstop del contador",
-  );
-  assert(
-    /no afirma NADA sobre el consultorio/i.test(bloque),
-    "falta la condición (c): un saludo tampoco puede inventar",
+    prompt.includes("No hay reglas adicionales por tipo"),
+    "falta la aclaración explícita de que no hay reglas por tipo",
   );
 });
 

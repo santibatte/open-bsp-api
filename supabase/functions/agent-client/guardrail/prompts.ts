@@ -77,8 +77,37 @@ import type { JSONSchema } from "./anthropic.ts";
  *                literal ya nombrado en el prompt) — queda registrado como
  *                inconsistencia conocida del modelo, no se persigue más por
  *                ahora (ver Incidente 8).
+ * v9 (pendiente de hash) — RELAJACIÓN deliberada del juez, pedida por Santi
+ *                2026-08-05 tras ver que el juez le rechazó una respuesta de
+ *                Botox maceteros/tercio superior que el propio prompt v8 ya
+ *                autorizaba explícitamente (la inconsistencia de Incidente 8,
+ *                en vivo). Se borró TODO el bloque "Si el tipo declarado es
+ *                X, aprobás solo si..." (8 sub-bloques, ~90 líneas) que
+ *                vivía debajo de CHEQUEO 1/CHEQUEO 2 — hipótesis de Santi:
+ *                la repetición de reglas y "RECHAZAR" por cada tipo estaba
+ *                empujando al juez a ser más estricto de lo necesario.
+ *                Decisión explícita, caso por caso, de qué se sacrifica:
+ *                - Ya NO se exige "cero cifras" en pedir_precision, ni "sin
+ *                  precio" en agendar — un precio literal del catálogo deja
+ *                  de ser motivo de rechazo por sí solo, sin importar el tipo
+ *                  declarado. Sigue prohibido (vía CHEQUEO 1, sin cambios)
+ *                  armar un listado de precios de VARIOS tratamientos a la
+ *                  vez — la protección real contra "dame toda la lista de
+ *                  precios" (prompt injection o pedido directo) se mantiene.
+ *                - Ya NO se valida el contador de fuera-de-tema para elegir
+ *                  entre saludo_generico/fuera_de_tema, ni se exige que
+ *                  seguimiento_tratamiento se apruebe pase lo que pase con
+ *                  ese contador — el juez ya no hace nada con el contador.
+ *                - La FAQ ya no tiene chequeo propio (el carve-out de que las
+ *                  señas no son "precio de tratamiento" queda sin uso porque
+ *                  ya no hay regla que las pudiera confundir).
+ *                Riesgo aceptado a propósito por Santi: más margen para que
+ *                se filtren precios fuera de contexto o mensajes repetidos de
+ *                bienvenida — evaluado como aceptable frente al costo real de
+ *                bloquear de más. Ver `P05_lecciones_guardrail.md` para el
+ *                detalle de la conversación caso por caso.
  */
-export const PROMPT_VERSION = 8;
+export const PROMPT_VERSION = 9;
 
 /**
  * Los ocho tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -546,96 +575,14 @@ QUÉ NO ES MOTIVO DE RECHAZO (no seas más estricto de lo necesario)
 Cordial, distante y simpática es exactamente el tono buscado: rechazar por
 "poco informativo", "incompleto" o "demasiado amable" sería un error.
 
-Si el tipo declarado es "catalogo":
-  Aprobás SOLO si CADA afirmación del mensaje está literalmente respaldada por
-  el catálogo de arriba (o es la derivación al mail de la excepción de arriba).
-  Cualquier cosa agregada, interpretada, extrapolada, inferida o inventada →
-  RECHAZAR, aunque sea verdad médica real, aunque sea información inofensiva,
-  aunque suene razonable.
-  Rechazá también si el mensaje da un diagnóstico, recomienda un tratamiento
-  para el caso particular de la persona, o se pronuncia sobre embarazo,
-  lactancia, alergias o medicación.
-  Verificá precios y nombres de tratamiento DÍGITO POR DÍGITO contra el catálogo.
-  Rechazá también si el mensaje habla de MÁS DE UN TRATAMIENTO DISTINTO o arma
-  un listado de precios de varias familias a la vez: cuando la consulta era
-  amplia, el tipo correcto era "pedir_precision", no "catalogo". Que cada
-  precio esté bien copiado no alcanza — la lista de precios no se manda nunca.
-  Esto NO aplica cuando son varias VARIANTES de la MISMA familia (ej. NIR
-  facial y corporal) etiquetadas por separado — eso está permitido, ver la
-  sección de arriba.
-
-Si el tipo declarado es "pedir_precision":
-  Es la respuesta a alguien que pidió precios en general o de varios
-  tratamientos a la vez. El mensaje tiene que pedirle que aclare qué tratamiento
-  puntual le interesa, y no tiene que dar ningún precio.
-  El chequeo central de este tipo: RECHAZAR si aparece CUALQUIER cifra de
-  dinero. Un importe, un "desde $X", un rango ("entre $X y $Y"), un descuento
-  con número, o un listado de tratamientos con importes al lado. Ni uno.
-  Nombrar tratamientos del catálogo SIN cifras al lado está permitido.
-  Si no hay cifras y el mensaje se limita a pedir la precisión con tono cordial,
-  APROBALO — pedir que aclaren no necesita respaldo en el catálogo.
-
-Si el tipo declarado es "faq":
-  Es la respuesta a una pregunta operativa del consultorio (horarios,
-  dirección, estacionamiento, medios de pago, duración de consulta, contacto,
-  cancelaciones, señas y alias).
-  Aprobás SOLO si CADA dato del mensaje está literalmente en la sección de FAQ
-  operativa autorizada de arriba. Cualquier dato agregado, interpretado o
-  inventado → RECHAZAR.
-  Los montos de SEÑA de esa sección (consulta médica $20.000, IPL/NIR
-  $50.000) son datos operativos fijos, NO precios de tratamiento — que el
-  mensaje los mencione (solos o junto con horarios/cancelación/otro dato FAQ)
-  NO lo convierte en "pedir_precision" ni amerita rechazo por eso. La regla
-  de "pedir_precision"/"cero cifras" es sobre PRECIOS DE TRATAMIENTO
-  (precios_vigentes), no sobre estos dos montos fijos de seña.
-  Rechazá también si el mensaje confirma o niega el estado de un turno
-  puntual de la paciente (agendado, cancelado, a qué hora, a nombre de qué
-  mail) — ningún dato de la FAQ operativa autoriza eso, no hay forma de
-  saberlo sin consultar Calendly.
-
-Si el tipo declarado es "agendar":
-  Es la respuesta a alguien que quiere sacar un turno directamente.
-  Aprobás SOLO si el link es exactamente ${CALENDLY_LINK} y el mensaje NO
-  menciona ninguna fecha, cupo o "jornada especial" que no esté confirmada en
-  el catálogo o en la FAQ operativa. RECHAZAR si menciona algún precio (eso
-  es "catalogo" o "pedir_precision") o si opina/recomienda algo.
-
-Si el tipo declarado es "seguimiento_tratamiento":
-  Es la respuesta a alguien que describe una reacción o duda sobre un
-  tratamiento ya realizado.
-  Aprobás SOLO si el mensaje se limita a derivar a ${MAIL_CONSULTAS} sin dar
-  ninguna opinión médica, sin decir si es normal o no, sin sugerir ninguna
-  acción sobre el tratamiento (usar o no usar algo, esperar, etc.). RECHAZAR
-  si el mensaje intenta tranquilizar con una valoración médica ("no es nada
-  grave", "es normal que pase") o si sugiere cualquier acción.
-  Este tipo se aprueba SIN IMPORTAR el contador de fuera de tema — nunca lo
-  rechaces por el valor del contador, esa condición es exclusiva de
-  "saludo_generico"/"fuera_de_tema".
-
-Si el tipo declarado es "saludo_generico":
-  Aprobás SOLO si se cumplen las TRES condiciones:
-  (a) El contador de arriba es exactamente 0. Si es 1 o más, el tipo correcto
-      era "fuera_de_tema", no este → RECHAZAR.
-  (b) El mensaje NO contesta, ni siquiera parcialmente, la pregunta original que
-      quedó fuera de tema. Ni afirmando, ni negando, ni con información parcial,
-      ni insinuando una respuesta.
-  (c) El mensaje no afirma NADA sobre el consultorio, la doctora ni los
-      tratamientos que no esté en el catálogo o en las excepciones autorizadas.
-      Presentarse como el consultorio de la ${NOMBRE_DOCTORA}, ofrecer ayuda e
-      invitar a agendar con el link autorizado está bien. Inventar horarios,
-      especialidades o alcances, o deslizar un consejo "al pasar", no.
-
-Si el tipo declarado es "fuera_de_tema":
-  Aprobás SOLO si se cumplen las CUATRO condiciones:
-  (a) El contador de arriba es 1 o más. Si es exactamente 0, el tipo correcto
-      era "saludo_generico", no este → RECHAZAR.
-  (b) El mensaje NO se vuelve a presentar ni saluda como si fuera la primera
-      vez ("Hola, este es el consultorio de..." es un error acá — eso ya se
-      hizo antes en la conversación).
-  (c) El mensaje NO contesta, ni siquiera parcialmente, la pregunta fuera de
-      tema original.
-  (d) El mensaje no afirma NADA sobre el consultorio que no esté en el
-      catálogo, la FAQ operativa o las excepciones autorizadas.
+No hay reglas adicionales por tipo de respuesta más allá de los dos chequeos
+de arriba: no rechaces por el tipo que haya declarado el redactor, ni por el
+valor del contador de fuera de tema, ni por mencionar el precio de un
+tratamiento fuera de un contexto puntual — mientras el precio sea literal del
+catálogo, no es un problema. La única excepción real dentro de CHEQUEO 1 sigue
+siendo armar un listado de precios de varios tratamientos a la vez (eso sigue
+prohibido: nunca se manda la lista completa de precios, ni siquiera pedida de
+a poco en mensajes separados).
 
 En "motivo" explicá en una o dos frases concretas por qué aprobás o rechazás. Si
 rechazás, señalá exactamente qué parte del mensaje es el problema — ese texto lo
