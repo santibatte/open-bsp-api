@@ -169,6 +169,46 @@ comment on function public.bump_offtopic_count(uuid) is
 grant execute on function public.bump_offtopic_count(uuid) to service_role;
 
 -- ============================================================
+-- 3. Memoria de contacto — email y nombre completo detectados
+-- ============================================================
+--
+-- Agregado 2026-08-05 junto con la memoria de corto plazo del guardrail
+-- (ver proyectos/P05_plan_memoria_agente.md en consultorio_dermatologico).
+-- Mismo patrón que bump_offtopic_count(): vive en contacts.extra (jsonb),
+-- mismo campo que ya usa offtopic_count. Claves nuevas: `email`,
+-- `nombre_completo`.
+--
+-- A diferencia de bump_offtopic_count(), acá no hace falta leer el valor
+-- anterior para decidir el nuevo (no hay lógica de incremento ni de
+-- expiración): el redactor ya decide el valor final a guardar (lo que la
+-- paciente escribió en el mensaje), así que un UPDATE de una sola sentencia
+-- que mergea el patch sobre extra alcanza — Postgres serializa dos UPDATE
+-- concurrentes sobre la misma fila sin necesidad de un `select ... for
+-- update` explícito (a diferencia del contador, acá no hay una decisión que
+-- dependa del valor anterior).
+--
+-- Devuelve void. No falla si el contacto no existe (0 filas afectadas).
+
+create or replace function public.merge_contact_datos_contacto(_contact_id uuid, _datos jsonb)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.contacts
+     set extra = coalesce(extra, '{}'::jsonb) || _datos,
+         updated_at = now()
+   where id = _contact_id;
+end;
+$$;
+
+comment on function public.merge_contact_datos_contacto(uuid, jsonb) is
+  'Mergea datos de contacto detectados por el redactor (email, nombre_completo) en contacts.extra, sin pisar otras claves. Usado por agent-client cuando el redactor devuelve datos_detectados no vacío.';
+
+grant execute on function public.merge_contact_datos_contacto(uuid, jsonb) to service_role;
+
+-- ============================================================
 -- Consultas útiles para la revisión manual
 -- ============================================================
 --

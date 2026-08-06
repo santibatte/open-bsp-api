@@ -27,6 +27,7 @@ import {
 } from "../agent-client/guardrail/anthropic.ts";
 import { cargarCatalogo } from "../agent-client/guardrail/catalogo.ts";
 import {
+  type DatosContactoGuardados,
   type SalidaJuez,
   type SalidaRedactor,
   SCHEMA_JUEZ,
@@ -37,6 +38,11 @@ import {
   userRedactor,
 } from "../agent-client/guardrail/prompts.ts";
 
+const SIN_DATOS_GUARDADOS: DatosContactoGuardados = {
+  email: null,
+  nombreCompleto: null,
+};
+
 // Organización "Vampiresa Meli" — ver project_stack_whatsapp_meta.md.
 const ORGANIZATION_ID = "cf231ab1-2432-4d56-baa1-ce900fe7b8b5";
 
@@ -45,6 +51,10 @@ interface CasoGoldenSet {
   descripcion: string;
   mensajePaciente: string;
   offtopicCount: number;
+  /** Memoria de corto plazo a simular. Vacío por defecto (primer mensaje). */
+  historialReciente?: string;
+  /** Memoria de largo plazo a simular. Sin datos guardados por defecto. */
+  datosGuardados?: DatosContactoGuardados;
 }
 
 /**
@@ -116,6 +126,25 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     mensajePaciente: "Vieron el partido de anoche?",
     offtopicCount: 2,
   },
+  {
+    id: "da_su_mail",
+    descripcion:
+      "Memoria de largo plazo: la paciente da su mail al pedir turno — datos_detectados.email debe capturarlo",
+    mensajePaciente:
+      "Dale quiero anotarme para un turno de botox, mi mail es maria.gomez@gmail.com",
+    offtopicCount: 0,
+  },
+  {
+    id: "ya_dio_mail_no_repreguntar",
+    descripcion:
+      "Memoria de largo plazo: el mail ya está guardado de una vuelta anterior — si la respuesta lo menciona, debería mostrar el guardado y pedir confirmación, no pedirlo de cero como si fuera la primera vez",
+    mensajePaciente:
+      "Quiero sacar otro turno, esta vez para un peeling. ¿Necesitan que les pase mi mail de nuevo?",
+    offtopicCount: 0,
+    historialReciente:
+      "Consultorio: ¡Hola! Para confirmarte el turno, ¿me pasás tu mail?\nPaciente: Sí, es maria.gomez@gmail.com",
+    datosGuardados: { email: "maria.gomez@gmail.com", nombreCompleto: null },
+  },
 ];
 
 interface ResultadoCaso {
@@ -125,6 +154,7 @@ interface ResultadoCaso {
   offtopicCount: number;
   tipo?: string;
   mensajeBorrador?: string;
+  datosDetectados?: SalidaRedactor["datos_detectados"];
   aprobado?: boolean;
   motivoJuez?: string;
   error?: string;
@@ -147,7 +177,12 @@ async function correrCaso(
   try {
     redactor = await callStructured<SalidaRedactor>({
       apiKey,
-      system: systemRedactor(catalogo, caso.offtopicCount),
+      system: systemRedactor(
+        catalogo,
+        caso.offtopicCount,
+        caso.historialReciente ?? "",
+        caso.datosGuardados ?? SIN_DATOS_GUARDADOS,
+      ),
       userMessage: userRedactor(caso.mensajePaciente),
       schema: SCHEMA_REDACTOR,
     });
@@ -161,7 +196,12 @@ async function correrCaso(
   }
 
   if (redactor.tipo === "silencio" || !redactor.mensaje?.trim()) {
-    return { ...base, tipo: redactor.tipo, mensajeBorrador: redactor.mensaje };
+    return {
+      ...base,
+      tipo: redactor.tipo,
+      mensajeBorrador: redactor.mensaje,
+      datosDetectados: redactor.datos_detectados,
+    };
   }
 
   let juez: SalidaJuez;
@@ -182,6 +222,7 @@ async function correrCaso(
       ...base,
       tipo: redactor.tipo,
       mensajeBorrador: redactor.mensaje,
+      datosDetectados: redactor.datos_detectados,
       error: `juez: ${
         error instanceof GuardrailLLMError ? error.message : String(error)
       }`,
@@ -192,6 +233,7 @@ async function correrCaso(
     ...base,
     tipo: redactor.tipo,
     mensajeBorrador: redactor.mensaje,
+    datosDetectados: redactor.datos_detectados,
     aprobado: juez.aprobado,
     motivoJuez: juez.motivo,
   };

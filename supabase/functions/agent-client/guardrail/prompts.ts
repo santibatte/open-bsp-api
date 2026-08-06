@@ -86,7 +86,6 @@ import type { JSONSchema } from "./anthropic.ts";
  *                vivía debajo de CHEQUEO 1/CHEQUEO 2 — hipótesis de Santi:
  *                la repetición de reglas y "RECHAZAR" por cada tipo estaba
  *                empujando al juez a ser más estricto de lo necesario.
- *                Decisión explícita, caso por caso, de qué se sacrifica:
  *                - Ya NO se exige "cero cifras" en pedir_precision, ni "sin
  *                  precio" en agendar — un precio literal del catálogo deja
  *                  de ser motivo de rechazo por sí solo, sin importar el tipo
@@ -106,8 +105,26 @@ import type { JSONSchema } from "./anthropic.ts";
  *                bienvenida — evaluado como aceptable frente al costo real de
  *                bloquear de más. Ver `P05_lecciones_guardrail.md` para el
  *                detalle de la conversación caso por caso.
+ * v10 (memoria de corto y largo plazo) — pedido de Santi 2026-08-05: el
+ *                redactor ahora recibe un bloque de "historial reciente de
+ *                esta conversación" (últimos mensajes, ambas direcciones,
+ *                armado en `agent-client/index.ts` a partir de
+ *                `public.messages` ya cargado) y un bloque de "datos ya
+ *                guardados de este contacto" (`extra.email`,
+ *                `extra.nombre_completo`, mismo campo `contacts.extra` que
+ *                ya usa `offtopic_count`). Instrucción nueva: si hace falta
+ *                pedir un dato ya guardado, mostrarlo y confirmar en vez de
+ *                pedirlo de cero. La salida del redactor suma
+ *                `datos_detectados: { email, nombre_completo }` (ambos
+ *                nullable) — si la paciente escribió alguno en ESE mensaje
+ *                puntual, se captura ahí; `guardrail/index.ts` lo persiste
+ *                de forma determinística vía
+ *                `merge_contact_datos_contacto()` (SQL,
+ *                `agent_guardrails.sql`), sin llamado extra a Claude. Ver
+ *                `proyectos/P05_plan_memoria_agente.md` (repo
+ *                `consultorio_dermatologico`) para el diseño completo.
  */
-export const PROMPT_VERSION = 9;
+export const PROMPT_VERSION = 10;
 
 /**
  * Los ocho tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -158,6 +175,16 @@ export const TIPOS_RESPUESTA: readonly TipoRespuesta[] = [
 export interface SalidaRedactor {
   tipo: TipoRespuesta;
   mensaje: string;
+  /**
+   * Datos de contacto que la paciente escribió en ESTE mensaje puntual
+   * (no inferidos del historial ni copiados de lo ya guardado). Ambos
+   * nullable — ver `guardarDatosContacto()` en `guardrail/index.ts`, que
+   * persiste esto vía `merge_contact_datos_contacto()` (SQL).
+   */
+  datos_detectados: {
+    email: string | null;
+    nombre_completo: string | null;
+  };
 }
 
 export interface SalidaJuez {
@@ -182,8 +209,27 @@ export const SCHEMA_REDACTOR: JSONSchema = {
       description:
         "El texto a enviarle a la paciente. Cadena vacía si tipo es 'silencio'.",
     },
+    datos_detectados: {
+      type: "object",
+      description:
+        "Datos de contacto de la paciente detectados en ESTE mensaje puntual (no en el historial ni en lo ya guardado). Si no mencionó ninguno acá, ambos campos van en null.",
+      properties: {
+        email: {
+          description:
+            "Mail que la paciente escribió en este mensaje, tal cual lo dio. null si no lo mencionó en este mensaje puntual.",
+          anyOf: [{ type: "string" }, { type: "null" }],
+        },
+        nombre_completo: {
+          description:
+            "Nombre y apellido que la paciente escribió en este mensaje, tal cual los dio. null si no los mencionó en este mensaje puntual.",
+          anyOf: [{ type: "string" }, { type: "null" }],
+        },
+      },
+      required: ["email", "nombre_completo"],
+      additionalProperties: false,
+    },
   },
-  required: ["tipo", "mensaje"],
+  required: ["tipo", "mensaje", "datos_detectados"],
   additionalProperties: false,
 };
 
@@ -210,9 +256,16 @@ export const SCHEMA_JUEZ: JSONSchema = {
  * `catalogo` viene de `cargarCatalogo()`: los precios vigentes de Supabase ya
  * filtrados por la lista curada de servicios habilitados.
  */
+export interface DatosContactoGuardados {
+  email: string | null;
+  nombreCompleto: string | null;
+}
+
 export function systemRedactor(
   catalogo: string,
   offtopicCount: number,
+  historialReciente: string,
+  datosGuardados: DatosContactoGuardados,
 ): string {
   return `Sos la asistente y recepcionista del consultorio de la ${NOMBRE_DOCTORA}, dermatóloga en Buenos Aires, Argentina. Atendés el WhatsApp del consultorio.
 
@@ -313,6 +366,29 @@ cuándo va "pedir_precision", "faq", "agendar", "saludo_generico",
 tema (para eso siguen valiendo las reglas de abajo tal cual).
 
 CONTADOR DE PREGUNTAS FUERA DE TEMA DE ESTA PERSONA: ${offtopicCount}
+
+════════════════════════════════════════
+HISTORIAL RECIENTE DE ESTA CONVERSACIÓN
+════════════════════════════════════════
+Los últimos mensajes de esta conversación (los más viejos primero), para que
+tengas contexto de lo que ya se habló — por ejemplo, si vos ya pediste algo
+o la paciente ya contestó algo. Esto NO es el mensaje a clasificar: el
+mensaje a clasificar es el que está más abajo, en <mensaje_paciente>.
+${historialReciente || "(sin mensajes anteriores en esta conversación)"}
+
+════════════════════════════════════════
+DATOS YA GUARDADOS DE ESTE CONTACTO
+════════════════════════════════════════
+Mail: ${datosGuardados.email ?? "ninguno guardado"}
+Nombre completo: ${datosGuardados.nombreCompleto ?? "ninguno guardado"}
+
+Si en tu respuesta necesitás pedirle a la paciente alguno de estos datos
+(por ejemplo, para confirmar un turno) y ya está guardado acá arriba, NO lo
+vuelvas a pedir de cero: mostraselo y pedile que confirme o corrija. Ejemplo:
+"Tengo anotado tu mail como ${
+    datosGuardados.email ?? "tal-cosa@ejemplo.com"
+  } — ¿lo uso o me pasás otro?". Si no hay nada guardado, pedíselo con
+naturalidad, como la primera vez.
 
 ════════════════════════════════════════
 CÓMO ELEGIR EL "tipo"
@@ -452,6 +528,20 @@ los dos tipos usar).
    contenido interpretable (vacío, un emoji suelto sin ningún contexto) y
    ninguna de las categorías de arriba aplica.
    Qué va en "mensaje": cadena vacía "".
+
+════════════════════════════════════════
+CÓMO COMPLETAR "datos_detectados"
+════════════════════════════════════════
+Además de "tipo" y "mensaje", tu respuesta SIEMPRE incluye "datos_detectados"
+con dos campos: "email" y "nombre_completo".
+- Si en ESTE mensaje (el de <mensaje_paciente>, no el historial de arriba)
+  la paciente escribió su mail, poné ese mail tal cual lo escribió en
+  "email". Si no lo mencionó en este mensaje puntual, "email" va en null —
+  aunque ya haya uno guardado más arriba, aunque lo haya mencionado en un
+  mensaje anterior del historial. Nunca inventes ni completes un mail.
+- Mismo criterio para "nombre_completo": solo si lo escribió en ESTE
+  mensaje, nunca inferido ni copiado del historial o de los datos ya
+  guardados.
 
 ESTILO (aplica a todos los tipos con mensaje, es decir todos menos "silencio"):
 - Cordial, simpática, profesional. Cálida pero a distancia: sos la

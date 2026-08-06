@@ -168,6 +168,54 @@ function getIncomingBurstText(
   return textos.join("\n");
 }
 
+/**
+ * Cuántos mensajes anteriores al mensaje actual se le pasan al redactor como
+ * "historial reciente" (memoria de corto plazo, ver
+ * `proyectos/P05_plan_memoria_agente.md` en `consultorio_dermatologico`).
+ * Decisión de costo de Santi 2026-08-05, no un límite técnico.
+ */
+const HISTORIAL_RECIENTE_MAX_MENSAJES = 10;
+
+/**
+ * Texto plano tipo "Paciente: ..." / "Consultorio: ..." de los mensajes que
+ * anteceden a `newestMessage`, para darle al redactor contexto de lo que ya
+ * se habló sin rearquitecturar el cliente de Claude para mandar un array de
+ * turnos reales (ver el comentario largo de `guardrail/anthropic.ts` sobre
+ * por qué ese cambio queda para más adelante). Mensajes "internal" no se
+ * muestran — son ruido interno de la plataforma, no diálogo con la paciente.
+ */
+function getRecentHistoryText(
+  messages: MessageRow[],
+  newestMessage: MessageRow,
+  maxMessages: number,
+): string {
+  const newestIndex = messages.findIndex((m) => m.id === newestMessage.id);
+
+  if (newestIndex <= 0) return "";
+
+  const desde = Math.max(0, newestIndex - maxMessages);
+
+  return messages
+    .slice(desde, newestIndex)
+    .map((m) => {
+      const quien = m.direction === "incoming"
+        ? "Paciente"
+        : m.direction === "outgoing"
+        ? "Consultorio"
+        : null;
+
+      if (!quien) return null;
+
+      const texto = m.content.type === "text"
+        ? m.content.text.trim()
+        : "[mensaje no textual]";
+
+      return texto ? `${quien}: ${texto}` : null;
+    })
+    .filter((linea): linea is string => Boolean(linea))
+    .join("\n");
+}
+
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 Deno.serve(async (req) => {
@@ -522,6 +570,12 @@ Deno.serve(async (req) => {
       tipoMensaje = "texto vacío";
     }
 
+    const historialReciente = getRecentHistoryText(
+      messages,
+      newestMessage,
+      HISTORIAL_RECIENTE_MAX_MENSAJES,
+    );
+
     const result = await runGuardrail({
       client,
       conversation: conv,
@@ -529,6 +583,7 @@ Deno.serve(async (req) => {
       agent,
       tipoMensaje,
       mensajePaciente,
+      historialReciente,
       headers: {
         "organization-id": organization_id,
         "conversation-id": conv.id,

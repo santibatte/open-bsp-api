@@ -36,6 +36,7 @@ import {
   MENSAJE_NO_TEXTUAL,
 } from "./catalogo.ts";
 import {
+  type DatosContactoGuardados,
   type SalidaJuez,
   type SalidaRedactor,
   SCHEMA_JUEZ,
@@ -59,6 +60,12 @@ export interface GuardrailParams {
   tipoMensaje: string;
   /** Texto del mensaje entrante. Vacío cuando `tipoMensaje` no es "text". */
   mensajePaciente: string;
+  /**
+   * Últimos mensajes de la conversación (ambas direcciones), como texto
+   * plano — memoria de corto plazo. Armado en `agent-client/index.ts`. Vacío
+   * si es el primer mensaje de la conversación.
+   */
+  historialReciente?: string;
   /** Headers de trazabilidad (organization-id, conversation-id, ...). */
   headers?: Record<string, string>;
 }
@@ -132,6 +139,63 @@ async function incrementarOfftopic(
     // No es fatal: ya decidimos no responder. Pero sí hay que verlo en los logs,
     // porque significa que la próxima repregunta va a recibir saludo de nuevo.
     log.error("Falló bump_offtopic_count", error);
+  }
+}
+
+/**
+ * Lee los datos de contacto ya guardados (memoria de largo plazo). Mismo
+ * campo `contacts.extra` que `offtopic_count`, claves `email` y
+ * `nombre_completo`. Ausentes o vacíos = null (no "" — evita mostrarle al
+ * redactor un dato guardado en blanco).
+ */
+function leerDatosContacto(contact?: ContactRow): DatosContactoGuardados {
+  const extra = contact?.extra as Record<string, unknown> | null | undefined;
+
+  const email = typeof extra?.email === "string" && extra.email.trim()
+    ? extra.email.trim()
+    : null;
+
+  const nombreCompleto =
+    typeof extra?.nombre_completo === "string" && extra.nombre_completo.trim()
+      ? extra.nombre_completo.trim()
+      : null;
+
+  return { email, nombreCompleto };
+}
+
+/**
+ * Persiste los datos que el redactor detectó en el mensaje (memoria de
+ * largo plazo), vía RPC atómico (ver
+ * `merge_contact_datos_contacto()` en `agent_guardrails.sql`) — mismo
+ * patrón que `incrementarOfftopic()`. No hace nada si el redactor no
+ * detectó ningún dato nuevo en este mensaje puntual.
+ */
+async function guardarDatosContacto(
+  client: SupabaseClient,
+  contact: ContactRow | undefined,
+  datos: SalidaRedactor["datos_detectados"] | undefined,
+): Promise<void> {
+  if (!contact?.id || !datos) return;
+
+  const patch: Record<string, string> = {};
+
+  if (typeof datos.email === "string" && datos.email.trim()) {
+    patch.email = datos.email.trim();
+  }
+
+  if (typeof datos.nombre_completo === "string" && datos.nombre_completo.trim()) {
+    patch.nombre_completo = datos.nombre_completo.trim();
+  }
+
+  if (!Object.keys(patch).length) return;
+
+  const { error } = await client.rpc("merge_contact_datos_contacto", {
+    _contact_id: contact.id,
+    _datos: patch,
+  });
+
+  if (error) {
+    log.error("Falló merge_contact_datos_contacto", error);
   }
 }
 
@@ -213,10 +277,12 @@ export async function runGuardrail(
     agent,
     tipoMensaje,
     mensajePaciente,
+    historialReciente,
     headers,
   } = params;
 
   const offtopicCount = leerOfftopicCount(contact);
+  const datosGuardados = leerDatosContacto(contact);
 
   // ── Portón 0: falta la config que se edita a mano ──
   // Sin lista curada de servicios habilitados (o sin link de Calendly) el
@@ -312,7 +378,12 @@ export async function runGuardrail(
   try {
     redactor = await callStructured<SalidaRedactor>({
       ...llamado,
-      system: systemRedactor(catalogo, offtopicCount),
+      system: systemRedactor(
+        catalogo,
+        offtopicCount,
+        historialReciente ?? "",
+        datosGuardados,
+      ),
       userMessage: userRedactor(mensajePaciente),
       schema: SCHEMA_REDACTOR,
     });
@@ -338,6 +409,11 @@ export async function runGuardrail(
     tipo: redactor.tipo,
     offtopic_count: offtopicCount,
   });
+
+  // Memoria de largo plazo: si la paciente escribió su mail o su nombre en
+  // este mensaje, guardarlo — independiente de si el juez termina aprobando
+  // la respuesta o no (ver Pieza 2 de proyectos/P05_plan_memoria_agente.md).
+  await guardarDatosContacto(client, contact, redactor.datos_detectados);
 
   // ── Camino SILENCIO: no hay juez, no hay nada que aprobar ──
   if (redactor.tipo === "silencio") {
