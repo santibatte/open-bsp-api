@@ -77,6 +77,8 @@ import {
   userReescritura,
 } from "./prompts.ts";
 import {
+  aplicarOverrideEtapaSobreTipo,
+  calcularSubEstadoParaLlamado,
   ejecutarPasoTurnos,
   guardarSubEstado,
   leerSubEstado,
@@ -430,34 +432,17 @@ export async function runGuardrail(
   log.info("Guardrail — redactor", { tipo: redactor.tipo, etapa });
 
   // ── Override: la ETAPA pisa al "tipo" del redactor cuando ya estamos
-  // agendando (Incidente 13, 2026-08-08) ──
-  //
-  // El redactor clasifica "tipo" mirando prácticamente solo el mensaje
-  // actual; la etapa se calcula con la conversación completa y es
-  // deliberadamente "pegajosa" (ver systemEtapa: "es acumulativa"). Un
-  // mensaje corto de continuación ("17 hs", "santiago battezzati
-  // primaveramanual@gmail.com") no siempre se lee por sí solo como pedido de
-  // turno, y el redactor lo clasificaba como "agendar"/"faq" — perdiendo el
-  // sub-estado, ofreciendo el link de Calendly o el mail de la doctora para
-  // "reservar" (ese mail NUNCA es para agendar, es solo para seguimiento
-  // médico) y, en el caso más grave, nunca llegando a llamar
-  // "agendar_turno" aunque ya hubiera día, hora, mail y nombre. Si ya
-  // estamos en "agendando"/"agendado", confiamos en la etapa por sobre el
-  // tipo — salvo las dos excepciones de seguridad que siempre pisan
-  // cualquier otra cosa: mensaje no interpretable, o un síntoma real que
-  // tiene que ir SIEMPRE al mail de la doctora sin importar en qué anda el
-  // agendamiento.
-  if (
-    (etapa === "agendando" || etapa === "agendado") &&
-    redactor.tipo !== "silencio" &&
-    redactor.tipo !== "seguimiento_tratamiento" &&
-    redactor.tipo !== "gestion_turno"
-  ) {
+  // agendando (Incidente 13, 2026-08-08) — ver `aplicarOverrideEtapaSobreTipo`
+  // en turnos.ts para el porqué y por qué está factorizada ahí (el golden
+  // set la llama también).
+  const tipoConOverride = aplicarOverrideEtapaSobreTipo(redactor.tipo, etapa);
+
+  if (tipoConOverride !== redactor.tipo) {
     log.info("Guardrail — override: la etapa fuerza gestion_turno", {
       tipo_original: redactor.tipo,
       etapa,
     });
-    redactor.tipo = "gestion_turno";
+    redactor.tipo = tipoConOverride;
     redactor.mensaje = "";
   }
 
@@ -564,6 +549,29 @@ export async function runGuardrail(
       };
     }
 
+    // ── Incidente 13b (2026-08-08): el mail/nombre de ESTE mensaje tienen
+    // que poder abrir el gate de `agendar_turno` en el MISMO turno, no en el
+    // siguiente — ver `calcularSubEstadoParaLlamado` en turnos.ts (el golden
+    // set la llama también, mismo motivo que el override de arriba). ──
+    const subEstadoParaLlamado = calcularSubEstadoParaLlamado(
+      subEstado,
+      datosGuardados,
+      redactor.datos_detectados,
+    );
+
+    if (subEstadoParaLlamado !== subEstado) {
+      log.info(
+        "Guardrail — sub-estado adelantado antes de llamar a turnos (datos ya completos en este mensaje)",
+        { de: subEstado, a: subEstadoParaLlamado },
+      );
+    }
+
+    const datosEfectivosDeEsteMensaje = {
+      email: redactor.datos_detectados.email?.trim() || datosGuardados.email,
+      nombreCompleto: redactor.datos_detectados.nombre_completo?.trim() ||
+        datosGuardados.nombreCompleto,
+    };
+
     const pasoTurnos = await ejecutarPasoTurnos({
       llamado,
       catalogo,
@@ -571,8 +579,11 @@ export async function runGuardrail(
       historial,
       historialTexto: historialComoTexto(historial),
       turnosExistentes,
-      subEstado,
-      datosGuardados,
+      subEstado: subEstadoParaLlamado,
+      datosGuardados: {
+        email: datosEfectivosDeEsteMensaje.email,
+        nombreCompleto: datosEfectivosDeEsteMensaje.nombreCompleto,
+      },
       onLlamado: hookCosto({ ...costoBase, step: "turnos" }),
       tools: calendlyTools,
       client,

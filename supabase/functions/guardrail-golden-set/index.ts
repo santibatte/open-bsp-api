@@ -51,7 +51,11 @@ import {
   type GuardrailTurn,
 } from "../agent-client/guardrail/anthropic.ts";
 import { agregarTurnoFinal } from "../agent-client/guardrail/index.ts";
-import { ejecutarPasoTurnos } from "../agent-client/guardrail/turnos.ts";
+import {
+  aplicarOverrideEtapaSobreTipo,
+  calcularSubEstadoParaLlamado,
+  ejecutarPasoTurnos,
+} from "../agent-client/guardrail/turnos.ts";
 import { cargarCatalogo } from "../agent-client/guardrail/catalogo.ts";
 import {
   type DatosContactoGuardados,
@@ -427,6 +431,52 @@ const GOLDEN_SET: CasoGoldenSet[] = [
       hora: "11:00",
       tipoEvento: "Botox maceteros",
       tratamientoSolicitado: "botox",
+    },
+  },
+  {
+    // Incidente 13 (2026-08-08, P05_lecciones_guardrail.md): bug real que
+    // Santi encontró probando en vivo minutos después de activar v42 —
+    // día+hora ya acordados, el bot pide nombre+mail, la paciente los manda
+    // SOLOS (sin repetir día/hora ni decir "quiero agendar"). El redactor,
+    // mirando casi solo este mensaje, lo clasificaba mal (agendar/faq) y
+    // ofrecía el link de Calendly o el mail de la doctora en vez de
+    // completar la reserva — nunca llegaba a llamar agendar_turno. Fix: la
+    // etapa fuerza gestion_turno cuando ya estamos agendando/agendado.
+    id: "confirmando_datos_mensaje_solo_nombre_y_mail",
+    subEstado: "confirmando_datos",
+    etapaGuardada: "agendando",
+    descripcion:
+      "Réplica del bug real de Santi: día y hora ya acordados en el historial, el bot pidió nombre+mail, la paciente los manda en un mensaje que NO menciona día, hora, ni la palabra 'turno'/'agendar' — el redactor tiende a perder el hilo acá. Tiene que seguir en gestion_turno y terminar llamando agendar_turno con los datos del historial + este mensaje.",
+    mensajePaciente: "Santiago Battezzati, primaveramanual@gmail.com",
+    historialTurnos: [
+      {
+        role: "user",
+        content:
+          "<mensaje_paciente>\nMe podrías dar turno vos, para el 20 de agosto?\n</mensaje_paciente>",
+      },
+      {
+        role: "assistant",
+        content:
+          "Perfecto, el 20 de agosto tengo lugar a las 15:30, 16:00, 17:00 y 18:00. ¿Cuál de estos horarios te viene bien?",
+      },
+      {
+        role: "user",
+        content: "<mensaje_paciente>\n17 hs\n</mensaje_paciente>",
+      },
+      {
+        role: "assistant",
+        content:
+          "Perfecto, para reservarte el 20/08 a las 17:00 necesito tu nombre completo y tu mail.",
+      },
+    ],
+    turnosFixture: [],
+    agendarFixture: {
+      agendado: true,
+      eventUuid: "evt-fixture-incidente13-1",
+      fecha: "20/08/2026",
+      hora: "17:00",
+      tipoEvento: "Mesoterapia",
+      tratamientoSolicitado: "mesoterapia",
     },
   },
   {
@@ -823,6 +873,23 @@ async function correrCaso(
     };
   }
 
+  // Incidente 13d (2026-08-08): este archivo tiene su propia copia del
+  // pipeline (no puede invocar el handler real, que depende de la request
+  // HTTP completa) — por eso el override de etapa y el adelanto de
+  // sub-estado viven exportados en turnos.ts y se llaman ACÁ TAMBIÉN, no se
+  // reimplementan. La primera vez que se rompió esto (mismo bug, dos veces:
+  // el golden set daba 32/32 mientras la producción real fallaba en vivo)
+  // fue exactamente por tener esta lógica duplicada en vez de compartida.
+  const tipoConOverride = aplicarOverrideEtapaSobreTipo(
+    redactor.tipo,
+    etapaCalculada,
+  );
+
+  if (tipoConOverride !== redactor.tipo) {
+    redactor.tipo = tipoConOverride;
+    redactor.mensaje = "";
+  }
+
   if (redactor.tipo === "silencio") {
     return {
       ...base,
@@ -838,6 +905,12 @@ async function correrCaso(
   const llamadaRegistrada: { nombre?: string; args?: unknown } = {};
 
   if (redactor.tipo === "gestion_turno") {
+    const subEstadoParaLlamado = calcularSubEstadoParaLlamado(
+      subEstado,
+      datosGuardados,
+      redactor.datos_detectados,
+    );
+
     const pasoTurnos = await ejecutarPasoTurnos({
       llamado: { apiKey },
       catalogo,
@@ -847,8 +920,13 @@ async function correrCaso(
         .map((t) => (typeof t.content === "string" ? t.content : ""))
         .join("\n"),
       turnosExistentes: caso.turnosFixture ?? [],
-      subEstado,
-      datosGuardados,
+      subEstado: subEstadoParaLlamado,
+      datosGuardados: {
+        email: redactor.datos_detectados.email?.trim() ||
+          datosGuardados.email,
+        nombreCompleto: redactor.datos_detectados.nombre_completo?.trim() ||
+          datosGuardados.nombreCompleto,
+      },
       tools: mockCalendlyTools(caso, llamadaRegistrada),
       client: createUnsecureClient(),
       conversation: conversationFicticia(caso.id),

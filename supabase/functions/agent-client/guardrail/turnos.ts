@@ -50,17 +50,96 @@ import {
 import {
   contextoAgenteTurnos,
   type DatosContactoGuardados,
+  type EtapaConversacion,
   type SalidaAgenteTurnos,
   SCHEMA_AGENTE_TURNOS,
   SUB_ESTADO_INICIAL,
   SUB_ESTADOS_AGENDAMIENTO,
   type SubEstadoAgendamiento,
   systemAgenteTurnosEstatico,
+  type TipoRespuesta,
   TOOL_AGENDAR_TURNO,
   TOOL_CONSULTAR_DISPONIBILIDAD,
   toolResultAgenteTurnos,
   userAgenteTurnos,
 } from "./prompts.ts";
+
+/**
+ * Incidente 13 (2026-08-08): la etapa (calculada con la conversación
+ * completa, deliberadamente "pegajosa") pisa al "tipo" del redactor cuando
+ * ya estamos agendando/agendado — un mensaje corto de continuación ("17
+ * hs", nombre+mail sueltos) no siempre se lee por sí solo como pedido de
+ * turno, y el redactor lo clasificaba mal, perdiendo el sub-estado. Las dos
+ * excepciones de seguridad (mensaje no interpretable, síntoma real) siempre
+ * ganan.
+ *
+ * Factorizada acá (no inline en `index.ts`) y EXPORTADA a propósito:
+ * `guardrail-golden-set/index.ts` tiene su propia copia del pipeline (no
+ * puede llamar al handler real, que depende de la request HTTP completa) —
+ * si esta lógica vive solo en `index.ts`, el golden set se desincroniza en
+ * silencio y deja de probar el comportamiento real (pasó exactamente eso,
+ * ver Incidente 13d).
+ */
+export function aplicarOverrideEtapaSobreTipo(
+  tipo: TipoRespuesta,
+  etapa: EtapaConversacion,
+): TipoRespuesta {
+  if (
+    (etapa === "agendando" || etapa === "agendado") &&
+    tipo !== "silencio" &&
+    tipo !== "seguimiento_tratamiento" &&
+    tipo !== "gestion_turno"
+  ) {
+    return "gestion_turno";
+  }
+
+  return tipo;
+}
+
+/**
+ * Incidente 13b (2026-08-08): adelanta el sub-estado ANTES de llamar a
+ * `ejecutarPasoTurnos`, usando los datos ya conocidos antes de este llamado
+ * (guardados + recién detectados en este mensaje por el redactor) — así el
+ * gate de tools se abre en el MISMO turno en que se completan los datos que
+ * faltaban (ej. la paciente manda mail+nombre sueltos), no en el siguiente.
+ * Mismo motivo que `aplicarOverrideEtapaSobreTipo` para estar acá y no
+ * inline: la tiene que llamar también el golden set.
+ *
+ * ⚠️ Acotado a propósito a la transición `confirmando_datos` →
+ * `lista_para_agendar`, la ÚNICA segura para adelantar así: si ya estamos en
+ * `confirmando_datos`, el día/hora YA se verificaron contra Calendly de
+ * verdad en un turno anterior (es el único requisito para llegar a ese
+ * escalón) — lo único que puede faltar es la identidad. Adelantar TAMBIÉN
+ * desde `recolectando_horario` sería un bug distinto: un mensaje puede traer
+ * día+hora+mail+nombre todo junto sin que el día/hora se haya verificado
+ * todavía contra disponibilidad real — Incidente 13e, encontrado por el
+ * propio golden set (`subestado_gate_bloquea_agendar` empezó a fallar): el
+ * modelo, viéndose ya en `confirmando_datos`, daba por buena una fecha que
+ * nunca pasó por `consultar_disponibilidad`.
+ */
+export function calcularSubEstadoParaLlamado(
+  subEstado: SubEstadoAgendamiento,
+  datosGuardados: DatosContactoGuardados,
+  datosDetectadosEnEsteMensaje:
+    | { email: string | null; nombre_completo: string | null }
+    | undefined,
+): SubEstadoAgendamiento {
+  if (subEstado !== "confirmando_datos") return subEstado;
+
+  const datosEfectivos = {
+    email: datosDetectadosEnEsteMensaje?.email?.trim() ||
+      datosGuardados.email,
+    nombreCompleto: datosDetectadosEnEsteMensaje?.nombre_completo?.trim() ||
+      datosGuardados.nombreCompleto,
+  };
+
+  return proximoSubEstado(
+    subEstado,
+    "lista_para_agendar",
+    datosEfectivos,
+    false,
+  );
+}
 
 /**
  * ══════════════════════════════════════════════════════════════════════
@@ -824,6 +903,21 @@ export async function ejecutarPasoTurnos(
         // GATE DE CÓDIGO: `agendar_turno` ni siquiera viaja en el request si
         // el sub-estado no es `lista_para_agendar`.
         tools: toolsParaSubEstado(subEstado),
+        // Incidente 13c (2026-08-08): con la tool YA disponible en
+        // `lista_para_agendar`, el modelo igual optaba por texto — redactaba
+        // una "confirmación" sin haber llamado a la tool, dos rondas de
+        // ajuste de prompt no lo resolvieron de forma confiable (misma
+        // inconsistencia de LLM ya documentada en este proyecto, ver
+        // Incidentes 2/8/9). Mismo principio que el resto del guardrail: el
+        // gate es de código, no de prompt. Solo en la PRIMERA vuelta (antes
+        // de tener un tool_result): forzar que la respuesta sea una tool
+        // call (consultar_disponibilidad o agendar_turno, a elección del
+        // modelo — las dos siguen siendo válidas acá), nunca texto. En la
+        // vuelta siguiente (ya con el resultado real de la tool) NO se
+        // fuerza: ahí sí tiene que redactar la respuesta en texto.
+        toolChoice: subEstado === "lista_para_agendar" && vuelta === 0
+          ? { type: "any", disable_parallel_tool_use: true }
+          : undefined,
         onLlamado: params.onLlamado,
       });
     } catch (error) {

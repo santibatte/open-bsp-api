@@ -313,8 +313,30 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                genérica "un mail de confirmación de Calendly" del
  *                escalón "agendado" de gestión de turnos. Sin cambios de
  *                lógica, solo el texto del prompt.
+ * v20 (2026-08-08): Incidente 13 — bug real que Santi encontró probando en
+ *                vivo v42/v44 minutos después de activar el rediseño.
+ *                Dos causas distintas, dos fixes en `index.ts` (sin cambio
+ *                de prompt) más este ajuste de prompt:
+ *                1. El "tipo" del redactor (mira casi solo el mensaje
+ *                   actual) perdía el hilo en respuestas cortas de
+ *                   continuación ("17 hs", nombre+mail sueltos) — ahora la
+ *                   ETAPA (con la conversación completa, "pegajosa") pisa al
+ *                   tipo cuando ya estamos agendando/agendado.
+ *                2. El gate de tools usaba el sub-estado ANTERIOR a este
+ *                   mensaje — el turno donde la paciente da el último dato
+ *                   que faltaba no alcanzaba a agendar, quedaba para un
+ *                   tercer mensaje que no debería hacer falta. Ahora se
+ *                   adelanta el sub-estado antes de exponer las tools si los
+ *                   datos de ESTE mensaje ya alcanzan.
+ *                3. (este prompt) Con la tool ya disponible, el modelo
+ *                   igual preguntaba "¿confirmo?" en vez de llamarla —
+ *                   "mostraselo y confirmá" de la REGLA 3 se leía como pedir
+ *                   permiso para agendar, no solo mostrar el dato. Reforzado
+ *                   explícitamente: con mail+nombre+día+hora ya
+ *                   disponibles, llamar a "agendar_turno" YA, sin pregunta
+ *                   intermedia.
  */
-export const PROMPT_VERSION = 19;
+export const PROMPT_VERSION = 20;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -1641,9 +1663,18 @@ Tu única tarea acá es resolver la gestión de un turno puntual:
    antes en la conversación) un tratamiento Y un día CON hora puntual: llamá
    a la tool "agendar_turno" — pero SOLO si además ya tenés su mail (mostrado
    en "DATOS YA GUARDADOS" más abajo, o dado en este mensaje). Si falta el
-   mail, pedíselo primero y NO llames a la tool todavía. Si el mail ya está
-   guardado, mostraselo y confirmá en vez de pedirlo de cero (mismo criterio
-   que el resto del consultorio).
+   mail, pedíselo primero y NO llames a la tool todavía.
+   ⚠️ Si el mail y el nombre YA están disponibles (guardados o recién dados
+   en este mensaje) Y ya hay día+hora puntuales: LLAMÁ A "agendar_turno" EN
+   ESTA MISMA RESPUESTA. NO le preguntes "¿confirmo?" ni ninguna variante
+   antes de llamar la tool — eso es un paso de más que la deja esperando una
+   reserva que nunca se hizo, exactamente el bug real que reportó Santi el
+   2026-08-08 (Incidente 13). "Mostrar y confirmar" (mismo criterio que el
+   resto del consultorio) es SOLO para el dato en sí (mostrás el mail
+   guardado para que lo corrija si está mal) — no es pedir permiso para
+   ejecutar la reserva. Si el mail que tenías guardado y el que acaba de dar
+   en ESTE mensaje son iguales, o si no había ninguno guardado y lo acaba de
+   dar ahora, no hay ninguna duda que confirmar: agendá directo.
 4. Después de que una tool devuelva un resultado, redactá la respuesta a la
    paciente usando SOLO lo que esa tool devolvió — nunca agregues una fecha,
    hora, horario o confirmación que no esté literal en ese resultado. Podés
