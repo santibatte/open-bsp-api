@@ -429,6 +429,38 @@ export async function runGuardrail(
 
   log.info("Guardrail — redactor", { tipo: redactor.tipo, etapa });
 
+  // ── Override: la ETAPA pisa al "tipo" del redactor cuando ya estamos
+  // agendando (Incidente 13, 2026-08-08) ──
+  //
+  // El redactor clasifica "tipo" mirando prácticamente solo el mensaje
+  // actual; la etapa se calcula con la conversación completa y es
+  // deliberadamente "pegajosa" (ver systemEtapa: "es acumulativa"). Un
+  // mensaje corto de continuación ("17 hs", "santiago battezzati
+  // primaveramanual@gmail.com") no siempre se lee por sí solo como pedido de
+  // turno, y el redactor lo clasificaba como "agendar"/"faq" — perdiendo el
+  // sub-estado, ofreciendo el link de Calendly o el mail de la doctora para
+  // "reservar" (ese mail NUNCA es para agendar, es solo para seguimiento
+  // médico) y, en el caso más grave, nunca llegando a llamar
+  // "agendar_turno" aunque ya hubiera día, hora, mail y nombre. Si ya
+  // estamos en "agendando"/"agendado", confiamos en la etapa por sobre el
+  // tipo — salvo las dos excepciones de seguridad que siempre pisan
+  // cualquier otra cosa: mensaje no interpretable, o un síntoma real que
+  // tiene que ir SIEMPRE al mail de la doctora sin importar en qué anda el
+  // agendamiento.
+  if (
+    (etapa === "agendando" || etapa === "agendado") &&
+    redactor.tipo !== "silencio" &&
+    redactor.tipo !== "seguimiento_tratamiento" &&
+    redactor.tipo !== "gestion_turno"
+  ) {
+    log.info("Guardrail — override: la etapa fuerza gestion_turno", {
+      tipo_original: redactor.tipo,
+      etapa,
+    });
+    redactor.tipo = "gestion_turno";
+    redactor.mensaje = "";
+  }
+
   // Memoria de largo plazo: si la paciente escribió su mail o su nombre en
   // este mensaje, guardarlo — independiente de si el juez termina aprobando
   // la respuesta o no.
