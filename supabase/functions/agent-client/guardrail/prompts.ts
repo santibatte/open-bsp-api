@@ -246,8 +246,68 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                   existe en `lista_para_agendar`. Ambos persisten en
  *                   `contacts.extra` (mismo merge que `email`/
  *                   `nombre_completo`).
+ * v17 (2026-08-08) — tres bugs REALES encontrados en la primera corrida del
+ *                golden set contra v16 (32 casos, 29 aprobados). Los tres
+ *                son del mismo tipo que ya conocemos: el juez razonando de
+ *                más sobre algo que no le tocaba.
+ *                1. **El juez trataba la AUSENCIA de `EVIDENCIA DE TURNOS`
+ *                   como una prohibición de pasar el link de Calendly.** Leía
+ *                   "sin ese bloque, cualquier afirmación sobre un turno es
+ *                   inventada" y lo estiraba hasta "entonces no podés ni
+ *                   pasar el link". Rechazó `agendar`, `da_su_mail` y
+ *                   `ya_dio_mail_no_repreguntar` — o sea el pedido de turno
+ *                   genérico, que es de los mensajes MÁS frecuentes del
+ *                   consultorio, y que terminaba en silencio tras las dos
+ *                   vueltas. Fix: la fuente (c) ahora enumera qué cuenta
+ *                   como "afirmación sobre un turno concreto" (fecha, hora,
+ *                   hay/no hay lugar, turno existente, link de cancelación)
+ *                   y qué NO (pasar el link, invitar a agendar), y dice
+ *                   explícitamente que sin evidencia lo segundo se aprueba
+ *                   igual porque no hay nada que verificar.
+ *                2. **El juez inventaba semántica sobre el link**: rechazó
+ *                   uno correcto argumentando que "/30min es para consultas
+ *                   de 30 minutos, no para IPL". El link es UNO SOLO y sirve
+ *                   para todo; que la URL diga "30min" no significa nada.
+ *                   Fix: la fuente (d) le prohíbe analizar el link — lo
+ *                   único que verifica es que sea idéntico carácter por
+ *                   carácter.
+ *                3. **Un motivo mal leído del juez hacía que el reescritor
+ *                   inventara.** En `subestado_gate_bloquea_agendar` el juez
+ *                   leyó mal la evidencia ("sin horarios libres" como "hay
+ *                   turno"), y el reescritor obedeció: dio vuelta el mensaje
+ *                   de "no tengo disponibilidad" a "tengo disponibilidad" y
+ *                   de paso sumó una seña de $20.000 que era la de consulta
+ *                   médica, no la de botox. La segunda pasada del juez lo
+ *                   frenó (terminó en silencio, no en un mensaje malo), pero
+ *                   el patrón es peligroso. Fix: el reescritor suma dos
+ *                   reglas duras — nunca agregar un dato que el borrador no
+ *                   tenía, y nunca dar vuelta una afirmación; si el motivo
+ *                   parece pedir justo eso, asumir que está mal leído y
+ *                   resolver por el lado seguro (borrar la afirmación).
+ * v18 (2026-08-08) — la segunda corrida del golden set mostró que el fix 3
+ *                de v17 (reglas nuevas al reescritor) NO alcanzaba: el
+ *                reescritor seguía dando vuelta "no tengo disponibilidad" a
+ *                "tengo disponibilidad" e inventando una seña de $20.000.
+ *                Buscando por qué, la causa raíz NO estaba en el reescritor
+ *                ni en el juez sino en la EVIDENCIA, igual que en los
+ *                Incidentes 12 y 14: `formatearEvidenciaDisponibilidad`
+ *                (`turnos.ts`) escribía, para el caso SIN horarios libres,
+ *                "sin horarios libres (turno resuelto para 'botox' → turno
+ *                real en Calendly: 'botox')". Esa segunda mitad la agregó
+ *                v14 para defender la correspondencia de NOMBRES, pero
+ *                pegada a un "sin horarios libres" el juez la leía como "SÍ
+ *                hay un turno real ese día" y rechazaba el borrador
+ *                CORRECTO por contradecir la evidencia. El reescritor
+ *                después obedecía ese motivo equivocado.
+ *                Fix en el dato, no en el prompt: en la rama sin
+ *                disponibilidad la evidencia ya no cita el par
+ *                "pedido → turno real" (ahí no hay ningún nombre que
+ *                defender) y dice sin ambigüedad que ese día está SIN LUGAR.
+ *                Lección repetida por tercera vez y anotada como tal: cuando
+ *                el juez "razona mal" de forma consistente, mirar primero
+ *                qué dice exactamente el texto que está leyendo.
  */
-export const PROMPT_VERSION = 16;
+export const PROMPT_VERSION = 18;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -935,16 +995,34 @@ LAS CUATRO FUENTES AUTORIZADAS (ninguna más)
   (b) La FAQ OPERATIVA AUTORIZADA de más abajo.
   (c) El bloque EVIDENCIA DE TURNOS (si te lo pasaron en este mensaje) —
       resultado REAL de la API de Calendly, construido por código, nunca por
-      el modelo. Toda fecha, hora, disponibilidad o link de cancelación/
-      reprogramación tiene que estar LITERAL ahí. Si ese bloque NO está
-      presente, cualquier afirmación sobre un turno puntual es inventada:
-      rechazar sin excepción (es el error más grave posible acá).
+      el modelo. Toda AFIRMACIÓN SOBRE UN TURNO CONCRETO tiene que estar
+      LITERAL ahí, y si no está, rechazás sin excepción (un turno inventado
+      es el error más grave posible acá).
+      Qué cuenta como "afirmación sobre un turno concreto", y solo esto:
+        · una fecha o una hora puntual de turno ("el jueves 14/08 a las 10")
+        · decir que hay o que no hay lugar tal día
+        · describir un turno que la paciente ya tiene
+        · un link de cancelación o reprogramación
+      Qué NO cuenta (y por lo tanto NO necesita evidencia de ningún tipo):
+        · pasar el link de agendamiento o invitar a sacar turno
+        · decir que se puede agendar por ahí, para el tratamiento que sea
+        · confirmar que ya se tiene guardado el mail o el nombre
+      La AUSENCIA del bloque de evidencia NO prohíbe nada de esta segunda
+      lista. Un mensaje que solo pasa el link, sin ninguna fecha ni hora ni
+      afirmación de disponibilidad, se APRUEBA aunque no haya evidencia — no
+      hay nada que verificar.
   (d) Dos datos de contacto fijos, que no figuran en el catálogo y aun así
-      están siempre permitidos:
+      están siempre permitidos, SIEMPRE, sin depender de ninguna evidencia:
         · el mail ${MAIL_CONSULTAS}
-        · el link ${CALENDLY_LINK} — si aparece tiene que ser exactamente
-          ese, carácter por carácter. NO es obligatorio: rechazá por una URL
-          distinta, nunca por su ausencia.
+        · el link ${CALENDLY_LINK} — es EL ÚNICO link de agendamiento del
+          consultorio y sirve para CUALQUIER tratamiento. No lo analices: no
+          te preguntes si "30min" le corresponde a ese tratamiento, si hace
+          falta otro link para IPL o para una jornada especial, ni si la
+          duración cuadra con el catálogo. Ese razonamiento no es tuyo y no
+          hay ningún otro link que pudiera ser el correcto.
+          Lo único que verificás es que, SI aparece, esté escrito exactamente
+          así, carácter por carácter. Rechazá por una URL distinta; nunca por
+          su ausencia, nunca por "no corresponde a este tratamiento".
 
 ════════════════════════════════════════
 LO QUE **NO** JUZGÁS (nunca es motivo de rechazo)
@@ -1113,8 +1191,20 @@ REGLAS DE LA CORRECCIÓN:
 3. Si al sacar el dato la respuesta queda corta, está perfecto: una respuesta
    corta y cierta es mejor que una completa e inventada. Podés cerrar
    ofreciéndote a ayudar con otra cosa.
-4. Nunca agregues información nueva que el borrador no tenía.
-5. Devolvés SIEMPRE un JSON con un solo campo "mensaje": el texto final para
+4. NUNCA AGREGUES UN DATO QUE EL BORRADOR NO TENÍA. Corregir es sacar o
+   reemplazar, nunca sumar. Si el borrador no hablaba de precios, de señas,
+   de alias para transferir ni de horarios, tu versión tampoco. Aunque el
+   dato figure en el catálogo y aunque parezca que ayuda: si el motivo del
+   rechazo no lo pedía, no va.
+5. NUNCA DES VUELTA UNA AFIRMACIÓN. Si el borrador decía que NO hay lugar,
+   tu versión no puede decir que SÍ lo hay (ni al revés). Un rechazo es un
+   pedido de sacar o precisar un dato, jamás de afirmar lo contrario.
+   Si el motivo parece pedirte exactamente eso —dar vuelta un "no hay" en un
+   "sí hay", confirmar un turno que el borrador no confirmaba— asumí que el
+   motivo está mal leído y resolvelo por el lado seguro: BORRÁ la afirmación
+   discutida y dejá el resto, o dejá el mensaje como estaba. Nunca inventes
+   disponibilidad para conformar a un motivo.
+6. Devolvés SIEMPRE un JSON con un solo campo "mensaje": el texto final para
    la paciente. Nunca expliques qué cambiaste, nunca escribas "corregido:"
    ni nada por el estilo — el "mensaje" se envía tal cual.
 

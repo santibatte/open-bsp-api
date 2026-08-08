@@ -407,8 +407,45 @@ Deno.test("el juez autoriza explícitamente el mail Y el link de Calendly", () =
     "el link de Calendly no está autorizado",
   );
   assert(
-    /nunca por su ausencia/i.test(bloque),
+    /nunca por\s+su ausencia/i.test(bloque),
     "falta la aclaración de que el link NO es obligatorio (v15)",
+  );
+
+  // v17: el juez rechazó un link correcto argumentando que "/30min es para
+  // consultas de 30 minutos, no para IPL". El link es uno solo y sirve para
+  // todo — el juez no razona sobre él, solo lo compara carácter por carácter.
+  assert(
+    /No lo analices/i.test(bloque),
+    "falta la prohibición de razonar sobre el link (v17)",
+  );
+  assert(
+    /nunca por "no corresponde a este tratamiento"/i.test(bloque),
+    "falta la prohibición de rechazar el link por 'no corresponde al tratamiento' (v17)",
+  );
+});
+
+Deno.test("v17: sin evidencia de turnos, pasar el link igual se aprueba", () => {
+  const prompt = promptJuezCompleto(CATALOGO_FALSO);
+
+  const inicio = prompt.indexOf("LAS CUATRO FUENTES AUTORIZADAS");
+  const fin = prompt.indexOf("LO QUE **NO** JUZGÁS");
+  const bloque = prompt.slice(inicio, fin);
+
+  // El bug más caro de v16: el juez leía "sin evidencia, cualquier afirmación
+  // sobre un turno es inventada" y lo estiraba hasta prohibir el link, con lo
+  // que el pedido de turno genérico —de los mensajes más frecuentes del
+  // consultorio— terminaba en silencio.
+  assert(
+    /Qué NO cuenta/i.test(bloque),
+    "el juez tiene que tener la lista de lo que NO necesita evidencia (v17)",
+  );
+  assert(
+    /pasar el link de agendamiento o invitar a sacar turno/i.test(bloque),
+    "pasar el link tiene que estar explícitamente fuera de lo que exige evidencia",
+  );
+  assert(
+    /La AUSENCIA del bloque de evidencia NO prohíbe/i.test(bloque),
+    "falta la aclaración de que la ausencia de evidencia no prohíbe el link",
   );
 });
 
@@ -777,8 +814,22 @@ Deno.test("el reescritor corrige SOLO el motivo señalado y no inventa nada", ()
     "falta la instrucción de borrar el dato sin respaldo en vez de suavizarlo",
   );
   assert(
-    /Nunca agregues información nueva/i.test(prompt),
+    /NUNCA AGREGUES UN DATO QUE EL BORRADOR NO TENÍA/i.test(prompt),
     "falta la prohibición de agregar información nueva",
+  );
+  // v17: un motivo mal leído del juez hizo que el reescritor diera vuelta un
+  // "no hay disponibilidad" en "sí hay" y encima sumara una seña inventada.
+  assert(
+    /NUNCA DES VUELTA UNA AFIRMACIÓN/i.test(prompt),
+    "falta la prohibición de invertir una afirmación (v17)",
+  );
+  assert(
+    /asumí que el\s+motivo está mal leído/i.test(prompt),
+    "falta la salida segura cuando el motivo del juez parece pedir lo contrario (v17)",
+  );
+  assert(
+    /de señas/i.test(prompt),
+    "el reescritor tiene que tener prohibido sumar señas/precios que el borrador no tenía",
   );
   assert(
     /una respuesta\s+corta y cierta es mejor/i.test(prompt),

@@ -319,13 +319,26 @@ function formatearEvidenciaDisponibilidad(
   }
 
   if (resultado.motivo === "sin_horarios_ese_dia") {
-    const cita = citaTratamiento(
-      resultado.tratamientoSolicitado,
-      resultado.tipoEvento,
-    );
-    const base = `consultar_disponibilidad: sin horarios libres (${cita}) el ${
-      fechaConDiaSemana(resultado.fecha)
-    }.`;
+    // ⚠️ Acá NO se cita el par "pedido → turno real" a propósito (v18).
+    //
+    // Esa cita la agregó v14 para que el juez no rechazara por diferencia de
+    // NOMBRE entre el tratamiento que pidió la paciente y el `tipoEvento`
+    // genérico de Calendly. Pero pegada a un "sin horarios libres" se leía al
+    // revés: el juez veía "turno real en Calendly: 'botox'" y entendía que SÍ
+    // había un turno ese día, así que rechazaba el borrador correcto ("no
+    // tengo disponibilidad") por contradecir la evidencia — y el reescritor,
+    // obedeciendo ese motivo, daba vuelta el mensaje e inventaba una seña.
+    // Encontrado en la primera corrida del golden set contra v16.
+    //
+    // Es el mismo tipo de bug que los Incidentes 12 y 14: no era el modelo
+    // razonando mal, era la evidencia diciendo algo distinto de lo que pasó.
+    // En la rama SIN disponibilidad no hay ninguna correspondencia de nombre
+    // que defender (no se va a nombrar ningún turno), así que la cita no
+    // aporta nada y solo confunde.
+    const base =
+      `consultar_disponibilidad: NO hay NINGÚN horario libre para '${resultado.tratamientoSolicitado}' el ${
+        fechaConDiaSemana(resultado.fecha)
+      }. Ese día está SIN LUGAR: decir que hay disponibilidad ese día sería inventarlo.`;
 
     if (!resultado.alternativa) {
       return `${base} No hay disponibilidad tampoco en los próximos días — no menciones ningún día ni fecha como alternativa; si querés, podés preguntarle a la paciente si quiere que consultes otro día, sin nombrar cuál.`;
