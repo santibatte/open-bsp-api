@@ -1118,14 +1118,10 @@ Deno.test("el prompt de turnos explica los cuatro escalones y la regla de la alt
     "falta la obligación de mostrar y confirmar los datos ya guardados",
   );
 
-  // Aviso del mail de confirmación, sin inventar remitente.
+  // Aviso del mail de confirmación, con el remitente real (v19).
   assert(
-    /mail de confirmación de Calendly/i.test(prompt),
-    "falta el aviso proactivo del mail de confirmación",
-  );
-  assert(
-    /NO inventes de qué dirección o a nombre de quién/i.test(prompt),
-    "el prompt no debe permitir inventar el remitente del mail de Calendly",
+    /dra\.melisa\.altavista@gmail\.com/i.test(prompt),
+    "falta el aviso proactivo del mail de confirmación con el remitente real",
   );
   assert(/spam/i.test(prompt), "falta el aviso de revisar spam");
 });

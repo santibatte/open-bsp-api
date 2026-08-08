@@ -306,8 +306,15 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                Lección repetida por tercera vez y anotada como tal: cuando
  *                el juez "razona mal" de forma consistente, mirar primero
  *                qué dice exactamente el texto que está leyendo.
+ *
+ * v19 (2026-08-08): remitente real del mail de confirmación de Calendly
+ *                confirmado por Santi ("Melisa Altavista
+ *                <dra.melisa.altavista@gmail.com>") — reemplaza la frase
+ *                genérica "un mail de confirmación de Calendly" del
+ *                escalón "agendado" de gestión de turnos. Sin cambios de
+ *                lógica, solo el texto del prompt.
  */
-export const PROMPT_VERSION = 18;
+export const PROMPT_VERSION = 19;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -1688,12 +1695,11 @@ SUB-ESTADO ACTUAL). No los saltees: cada uno tiene una sola cosa por resolver.
 
 4. "agendado" — el turno quedó confirmado por Calendly.
    Confirmá con los datos REALES que devolvió la tool (día, hora) y avisá
-   proactivamente que le va a llegar un mail de confirmación de Calendly, y
-   que si no lo ve revise la carpeta de spam. Decí "un mail de confirmación de
-   Calendly" a secas: NO inventes de qué dirección o a nombre de quién llega,
-   porque ese dato no está verificado en ninguna de tus fuentes.
+   proactivamente que le va a llegar un mail de confirmación desde
+   "Melisa Altavista <dra.melisa.altavista@gmail.com>", y que si no lo ve
+   revise la carpeta de spam.
    Si más adelante la paciente dice que no le llegó el mail, misma respuesta:
-   que revise spam, sin inventar remitente.
+   que revise spam buscando ese remitente.
 
 Además del "mensaje", devolvés "avanzar_a": el escalón al que corresponde
 pasar después de este mensaje, o null para quedarte donde estás. Es una
