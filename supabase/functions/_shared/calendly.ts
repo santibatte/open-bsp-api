@@ -122,6 +122,37 @@ export type ResultadoDisponibilidad =
     alternativaAntes: { fecha: string; horarios: string[] } | null;
   };
 
+export interface OpcionDisponible {
+  fecha: string;
+  horarios: string[];
+}
+
+export type ResultadoDisponibilidadRango =
+  | {
+    disponible: true;
+    tipoEvento: string;
+    tratamientoSolicitado: string;
+    /** Hasta `MAX_OPCIONES_RANGO` días distintos del rango con al menos un
+     * horario libre (filtrado por franja horaria, si se pidió), ordenados
+     * cronológicamente — nunca todos los días del rango, para no saturar el
+     * mensaje. */
+    opciones: OpcionDisponible[];
+  }
+  | { disponible: false; motivo: "tipo_turno_ambiguo"; detalle: string }
+  | {
+    disponible: false;
+    motivo: "sin_horarios_en_rango";
+    tipoEvento: string;
+    tratamientoSolicitado: string;
+    fechaInicio: string;
+    fechaFin: string;
+    /** Mismo criterio que `ResultadoDisponibilidad`: alternativa real más
+     * cercana en cada dirección, buscando desde los bordes del rango
+     * consultado — `null` si no hay nada en esa dirección. */
+    alternativaAntes: OpcionDisponible | null;
+    alternativaDespues: OpcionDisponible | null;
+  };
+
 export interface CalendlyTools {
   consultarTurno(
     telefono: string,
@@ -142,6 +173,21 @@ export interface CalendlyTools {
      * ofrecer un turno en el pasado. */
     hoyISO: string,
   ): Promise<ResultadoDisponibilidad>;
+  /**
+   * Solo lectura — como `consultarDisponibilidad` pero para un RANGO de
+   * días (ej. "la semana que viene") en vez de uno solo, con filtro
+   * opcional por franja horaria. Agregada 2026-08-08: un pedido vago pero
+   * ACOTADO ("la semana que viene, cualquier tarde") tiene señal real
+   * suficiente para buscar disponibilidad de verdad — no hace falta
+   * degradar al link genérico solo porque no hay un día puntual.
+   */
+  consultarDisponibilidadRango(
+    tratamientoOTipoTurno: string,
+    fechaInicioISO: string,
+    fechaFinISO: string,
+    franja: "manana" | "tarde" | null,
+    hoyISO: string,
+  ): Promise<ResultadoDisponibilidadRango>;
   agendarTurno(args: AgendarArgs): Promise<ResultadoAgendar>;
 }
 
@@ -926,6 +972,140 @@ async function consultarDisponibilidad(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// TOOL — consultar_disponibilidad_rango (agregada 2026-08-08, ver el
+// comentario largo en `CalendlyTools.consultarDisponibilidadRango`). Reusa
+// `horariosDisponibles` (ya soporta un ancho de ventana en días) y
+// `diaConHorariosMasCercano`/`sumarDias`/`diasEntre` para la búsqueda de
+// alternativa cuando el rango pedido no tiene nada — mismo patrón que
+// `consultarDisponibilidad`, extendido a un rango en vez de un solo día.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Días distintos que se ofrecen como máximo cuando SÍ hay lugar en el
+ * rango — nunca todos, para no saturar el mensaje de WhatsApp. */
+const MAX_OPCIONES_RANGO = 3;
+
+/** Agrupa horarios reales (ya con offset, tal como los devuelve Calendly)
+ * por día calendario de Buenos Aires, descartando los que no caen en la
+ * franja horaria pedida (si se pidió alguna). */
+function agruparPorDia(
+  horarios: { start_time: string }[],
+  franja: "manana" | "tarde" | null,
+): Map<string, string[]> {
+  const porDia = new Map<string, string[]>();
+
+  for (const h of horarios) {
+    const hora = formatearFechaHoraLocal(h.start_time).hora;
+
+    if (franja) {
+      const hh = Number(hora.slice(0, 2));
+      const enFranja = franja === "manana" ? hh < 13 : hh >= 13;
+      if (!enFranja) continue;
+    }
+
+    const dia = fechaLocalISO(new Date(h.start_time));
+    const lista = porDia.get(dia) ?? [];
+    lista.push(hora);
+    porDia.set(dia, lista);
+  }
+
+  return porDia;
+}
+
+async function consultarDisponibilidadRango(
+  tratamientoOTipoTurno: string,
+  fechaInicioISO: string,
+  fechaFinISO: string,
+  franja: "manana" | "tarde" | null,
+  hoyISO: string,
+  opts: ClienteOpts,
+): Promise<ResultadoDisponibilidadRango> {
+  const resuelto = await resolverTipoTurno(tratamientoOTipoTurno, opts);
+
+  if (!resuelto.ok) {
+    return {
+      disponible: false,
+      motivo: "tipo_turno_ambiguo",
+      detalle: resuelto.detalle,
+    };
+  }
+
+  const tipo = resuelto.tipo;
+  const diasRango = diasEntre(fechaInicioISO, fechaFinISO) + 1;
+  const horarios = await horariosDisponibles(
+    tipo.uri,
+    fechaInicioISO,
+    opts,
+    diasRango,
+  );
+
+  const porDia = agruparPorDia(horarios, franja);
+  const diasConLugar = [...porDia.keys()].sort();
+
+  if (diasConLugar.length > 0) {
+    return {
+      disponible: true,
+      tipoEvento: tipo.nombre,
+      tratamientoSolicitado: tratamientoOTipoTurno,
+      opciones: diasConLugar.slice(0, MAX_OPCIONES_RANGO).map((dia) => ({
+        fecha: formatearFechaCalendarioDMY(dia),
+        horarios: porDia.get(dia)!,
+      })),
+    };
+  }
+
+  // Sin nada en el rango (con el filtro de franja aplicado, si había) —
+  // misma búsqueda bidireccional que ya existe para el caso de un día
+  // puntual, ANCLADA a los bordes del rango en vez de a un solo día.
+  const horariosVentanaDespues = await horariosDisponibles(
+    tipo.uri,
+    sumarDias(fechaFinISO, 1),
+    opts,
+    VENTANA_ALTERNATIVAS_DIAS,
+  );
+
+  const inicioAntesISO = (() => {
+    const candidato = sumarDias(fechaInicioISO, -VENTANA_ALTERNATIVAS_DIAS);
+    return candidato < hoyISO ? hoyISO : candidato;
+  })();
+  const diasVentanaAntes = diasEntre(inicioAntesISO, fechaInicioISO);
+
+  const horariosVentanaAntes = diasVentanaAntes > 0
+    ? await horariosDisponibles(
+      tipo.uri,
+      inicioAntesISO,
+      opts,
+      diasVentanaAntes,
+    )
+    : [];
+
+  const porDiaDespues = agruparPorDia(horariosVentanaDespues, franja);
+  const porDiaAntes = agruparPorDia(horariosVentanaAntes, franja);
+  const diaDespues = [...porDiaDespues.keys()].sort()[0];
+  const diaAntes = [...porDiaAntes.keys()].sort().pop();
+
+  return {
+    disponible: false,
+    motivo: "sin_horarios_en_rango",
+    tipoEvento: tipo.nombre,
+    tratamientoSolicitado: tratamientoOTipoTurno,
+    fechaInicio: formatearFechaCalendarioDMY(fechaInicioISO),
+    fechaFin: formatearFechaCalendarioDMY(fechaFinISO),
+    alternativaDespues: diaDespues
+      ? {
+        fecha: formatearFechaCalendarioDMY(diaDespues),
+        horarios: porDiaDespues.get(diaDespues)!,
+      }
+      : null,
+    alternativaAntes: diaAntes
+      ? {
+        fecha: formatearFechaCalendarioDMY(diaAntes),
+        horarios: porDiaAntes.get(diaAntes)!,
+      }
+      : null,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Factory — inyectable, para poder mockear en `guardrail-golden-set` sin
 // tocar Calendly real (ver P05_plan_tools_turnos.md sección 6).
 // ─────────────────────────────────────────────────────────────────────────
@@ -943,6 +1123,21 @@ export function crearCalendlyTools(
       consultarDisponibilidad(
         tratamientoOTipoTurno,
         fechaDeseada,
+        hoyISO,
+        clienteOpts,
+      ),
+    consultarDisponibilidadRango: (
+      tratamientoOTipoTurno,
+      fechaInicioISO,
+      fechaFinISO,
+      franja,
+      hoyISO,
+    ) =>
+      consultarDisponibilidadRango(
+        tratamientoOTipoTurno,
+        fechaInicioISO,
+        fechaFinISO,
+        franja,
         hoyISO,
         clienteOpts,
       ),

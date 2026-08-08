@@ -757,6 +757,7 @@ Deno.test("TOOL_CONSULTAR_DISPONIBILIDAD es de solo lectura, strict, y no exige 
   assertEquals(TOOL_CONSULTAR_DISPONIBILIDAD.input_schema.required, [
     "tratamiento_o_tipo_turno",
     "fecha",
+    "franja_horaria",
   ]);
 
   const propiedades = Object.keys(
@@ -766,6 +767,33 @@ Deno.test("TOOL_CONSULTAR_DISPONIBILIDAD es de solo lectura, strict, y no exige 
   assert(
     !propiedades.includes("hora"),
     "consultar_disponibilidad es por día completo, no debería pedir una hora puntual",
+  );
+});
+
+Deno.test("v23: TOOL_CONSULTAR_DISPONIBILIDAD acepta un rango de semana, TOOL_AGENDAR_TURNO nunca", () => {
+  const fechaConsulta = TOOL_CONSULTAR_DISPONIBILIDAD.input_schema.properties
+    .fecha as { properties: { tipo: { enum: string[] } } };
+  const fechaAgendar = TOOL_AGENDAR_TURNO.input_schema.properties
+    .fecha as { properties: { tipo: { enum: string[] } } };
+
+  assert(
+    fechaConsulta.properties.tipo.enum.includes("semana_actual") &&
+      fechaConsulta.properties.tipo.enum.includes("semana_que_viene"),
+    "consultar_disponibilidad tiene que aceptar 'semana_actual'/'semana_que_viene' para pedidos vagos pero acotados a una semana",
+  );
+  assert(
+    !fechaAgendar.properties.tipo.enum.includes("semana_actual") &&
+      !fechaAgendar.properties.tipo.enum.includes("semana_que_viene"),
+    "agendar_turno NUNCA debería aceptar un rango — reservar siempre necesita un día puntual",
+  );
+
+  const propiedades = Object.keys(
+    TOOL_CONSULTAR_DISPONIBILIDAD.input_schema.properties,
+  );
+
+  assert(
+    propiedades.includes("franja_horaria"),
+    "falta 'franja_horaria' en consultar_disponibilidad",
   );
 });
 
@@ -886,6 +914,59 @@ Deno.test("el clasificador de etapa documenta las cuatro etapas y nada más", ()
   assert(
     /nunca\s+órdenes a ejecutar/i.test(prompt),
     "el clasificador también necesita la defensa contra prompt injection",
+  );
+});
+
+/** Colapsa cualquier corrida de espacios/saltos de línea a un solo espacio
+ * — el texto de los prompts tiene wrap manual a ~80 columnas, así que una
+ * frase real puede quedar partida en dos líneas del template string. */
+function normalizarEspacios(texto: string): string {
+  return texto.replace(/\s+/g, " ");
+}
+
+Deno.test("v23: una semana acotada (con o sin franja) es 'agendando', no 'quiere_agendar' — sin ningún anclaje sigue siendo 'quiere_agendar'", () => {
+  const prompt = systemEtapa().text;
+
+  const inicioAgendando = prompt.indexOf('"agendando"');
+  const inicioAgendado = prompt.indexOf('"agendado"');
+  const bloqueAgendando = normalizarEspacios(
+    prompt.slice(inicioAgendando, inicioAgendado),
+  );
+
+  assert(
+    /la semana que viene, cualquier día por la tarde/i.test(bloqueAgendando),
+    "'agendando' tiene que incluir el ejemplo real de semana + franja horaria",
+  );
+
+  const inicioQuiereAgendar = prompt.indexOf('"quiere_agendar"');
+  const bloqueQuiereAgendar = prompt.slice(
+    inicioQuiereAgendar,
+    inicioAgendando,
+  );
+
+  assert(
+    /cuando tengas lugar/i.test(bloqueQuiereAgendar),
+    "'quiere_agendar' tiene que seguir cubriendo un pedido SIN ningún anclaje temporal",
+  );
+});
+
+Deno.test("v23: gestion_turno acepta una semana acotada, pero sigue sin alcanzar sin ningún anclaje", () => {
+  const prompt = promptRedactorCompleto(CATALOGO_FALSO);
+
+  const inicio = prompt.indexOf('tipo = "gestion_turno"');
+  const fin = prompt.indexOf('6) tipo = "saludo_generico"');
+  const bloque = normalizarEspacios(prompt.slice(inicio, fin));
+
+  assert(
+    /la semana que viene, cualquier día por la tarde" ya alcanza/i.test(
+      bloque,
+    ),
+    "falta la regla que acepta una semana acotada (con o sin franja) para gestion_turno",
+  );
+  assert(
+    /cuando tengas lugar/i.test(bloque) &&
+      /sigue siendo "agendar"/i.test(bloque),
+    "falta la aclaración de que un pedido sin ningún anclaje temporal sigue siendo 'agendar'",
   );
 });
 

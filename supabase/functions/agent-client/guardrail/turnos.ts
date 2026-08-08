@@ -25,8 +25,10 @@ import type { ContactRow, ConversationRow } from "../../_shared/supabase.ts";
 import type {
   AgendarArgs,
   CalendlyTools,
+  OpcionDisponible,
   ResultadoAgendar,
   ResultadoDisponibilidad,
+  ResultadoDisponibilidadRango,
   TurnoEncontrado,
 } from "../../_shared/calendly.ts";
 import {
@@ -36,8 +38,10 @@ import {
 } from "../../_shared/calendly.ts";
 import {
   type ExpresionFecha,
+  type ExpresionFechaConsulta,
   normalizarTexto,
   resolverFechaExpresion,
+  resolverRangoFecha,
   validarHoraHHMM,
 } from "../../_shared/fechas.ts";
 import {
@@ -444,6 +448,73 @@ function formatearEvidenciaDisponibilidad(
   return `consultar_disponibilidad: tipo de turno ambiguo — ${resultado.detalle}`;
 }
 
+/** Texto de una opción concreta (fecha + horarios), reusado en varias ramas
+ * de la evidencia de rango. */
+function formatearOpcion(opcion: OpcionDisponible): string {
+  return `el ${fechaConDiaSemana(opcion.fecha)} (${
+    opcion.horarios.join(", ")
+  })`;
+}
+
+/**
+ * Evidencia para "consultar_disponibilidad" cuando se consultó un RANGO
+ * (semana) en vez de un día puntual — mismo criterio que
+ * `formatearEvidenciaDisponibilidad`: nunca cita el par "pedido → turno
+ * real" en la rama SIN lugar, por el mismo motivo que v18 (ver el comentario
+ * largo de esa función) — pegar esa cita a un "sin lugar" se leía como "SÍ
+ * hay un turno real" y generaba rechazos falsos del juez.
+ *
+ * Formato en LISTA (una línea por opción), no una oración corrida — probado
+ * en vivo contra Claude real 2026-08-08 (golden set, caso
+ * `rango_semana_con_franja_ofrece_opciones`, 2/2 corridas): con una oración
+ * tipo "el X (h); el Y (h)." el modelo terminaba RECALCULANDO por su cuenta
+ * el día de semana de la segunda opción en vez de copiar el ya resuelto en
+ * la evidencia (mismo error de fondo que Incidente 9, ahora reaparecido acá
+ * porque antes solo se citaba UN día por evidencia, nunca una lista). La
+ * cita "pedido → turno real" también se repite en CADA línea (antes solo
+ * aparecía una vez al principio) — mismo motivo que Incidente 9
+ * (continuación)/v14: sin eso, el juez trataba la segunda opción en
+ * adelante como "sin confirmar para este tratamiento" y rechazaba en falso.
+ */
+function formatearEvidenciaDisponibilidadRango(
+  resultado: ResultadoDisponibilidadRango,
+): string {
+  if (resultado.disponible) {
+    const cita = citaTratamiento(
+      resultado.tratamientoSolicitado,
+      resultado.tipoEvento,
+    );
+    const lineas = resultado.opciones
+      .map((o) => `- ${formatearOpcion(o)} — ${cita}.`)
+      .join("\n");
+
+    return `Horarios libres reales en el rango consultado:\n${lineas}\nCada línea de arriba ya trae su día de semana correcto y la correspondencia de tratamiento — copialos tal cual, NUNCA recalcules vos ningún día de semana ni asumas que la correspondencia de tratamiento solo vale para la primera línea.`;
+  }
+
+  if (resultado.motivo === "sin_horarios_en_rango") {
+    const base =
+      `consultar_disponibilidad: NO hay NINGÚN horario libre para '${resultado.tratamientoSolicitado}' entre el ${resultado.fechaInicio} y el ${resultado.fechaFin}. Esa semana está SIN LUGAR: decir que hay disponibilidad ahí sería inventarlo.`;
+
+    const antes = resultado.alternativaAntes
+      ? `antes, ${formatearOpcion(resultado.alternativaAntes)}`
+      : null;
+    const despues = resultado.alternativaDespues
+      ? `más adelante, ${formatearOpcion(resultado.alternativaDespues)}`
+      : null;
+    const alternativas = [antes, despues].filter((x): x is string => !!x);
+
+    if (!alternativas.length) {
+      return `${base} No hay disponibilidad real tampoco antes ni después de ese rango (ambas direcciones ya consultadas) — no menciones ningún día ni fecha como alternativa; si querés, podés preguntarle a la paciente si quiere que consultes otra semana, sin nombrar cuál.`;
+    }
+
+    return `${base} Alternativa(s) real(es) más cercana(s) — ${
+      alternativas.join("; ")
+    }.`;
+  }
+
+  return `consultar_disponibilidad: tipo de turno ambiguo — ${resultado.detalle}`;
+}
+
 /** Evidencia mínima de que el DÍA que el modelo clasificó no es una
  * alucinación — busca la palabra que lo respalda (el nombre del día de
  * semana, "hoy"/"mañana"/"pasado mañana", o simplemente confía en
@@ -789,7 +860,11 @@ async function ejecutarToolConsultarDisponibilidad(
   const tratamiento = typeof args.tratamiento_o_tipo_turno === "string"
     ? args.tratamiento_o_tipo_turno
     : "";
-  const expr = args.fecha as ExpresionFecha | undefined;
+  const expr = args.fecha as ExpresionFechaConsulta | undefined;
+  const franja = args.franja_horaria === "manana" ||
+      args.franja_horaria === "tarde"
+    ? args.franja_horaria
+    : null;
 
   if (!tratamiento || !expr || typeof expr.tipo !== "string") {
     return {
@@ -799,35 +874,78 @@ async function ejecutarToolConsultarDisponibilidad(
     };
   }
 
-  const resuelta = resolverFechaExpresion(expr, ahora);
+  const esRango = expr.tipo === "semana_actual" ||
+    expr.tipo === "semana_que_viene";
 
-  if (!resuelta.ok) {
-    return {
-      ok: false,
-      motivo: `consultar_disponibilidad: fecha no resuelta: ${resuelta.motivo}`,
-    };
-  }
+  let resultado: ResultadoDisponibilidad | ResultadoDisponibilidadRango;
+  let evidencia: string;
 
-  let resultado: ResultadoDisponibilidad;
+  if (esRango) {
+    const resuelto = resolverRangoFecha(expr, ahora);
 
-  try {
-    resultado = await tools.consultarDisponibilidad(
-      tratamiento,
-      resuelta.fechaISO,
-      fechaLocalISO(ahora),
-    );
-  } catch (error) {
-    const detalle = error instanceof Error ? error.message : String(error);
+    if (!resuelto.ok) {
+      return {
+        ok: false,
+        motivo:
+          `consultar_disponibilidad: rango no resuelto: ${resuelto.motivo}`,
+      };
+    }
 
-    log.error(
-      "Paso de turnos — error ejecutando consultar_disponibilidad",
-      detalle,
-    );
+    try {
+      resultado = await tools.consultarDisponibilidadRango(
+        tratamiento,
+        resuelto.inicioISO,
+        resuelto.finISO,
+        franja,
+        fechaLocalISO(ahora),
+      );
+    } catch (error) {
+      const detalle = error instanceof Error ? error.message : String(error);
 
-    return {
-      ok: false,
-      motivo: `error ejecutando consultar_disponibilidad: ${detalle}`,
-    };
+      log.error(
+        "Paso de turnos — error ejecutando consultar_disponibilidad (rango)",
+        detalle,
+      );
+
+      return {
+        ok: false,
+        motivo: `error ejecutando consultar_disponibilidad: ${detalle}`,
+      };
+    }
+
+    evidencia = formatearEvidenciaDisponibilidadRango(resultado);
+  } else {
+    const resuelta = resolverFechaExpresion(expr as ExpresionFecha, ahora);
+
+    if (!resuelta.ok) {
+      return {
+        ok: false,
+        motivo:
+          `consultar_disponibilidad: fecha no resuelta: ${resuelta.motivo}`,
+      };
+    }
+
+    try {
+      resultado = await tools.consultarDisponibilidad(
+        tratamiento,
+        resuelta.fechaISO,
+        fechaLocalISO(ahora),
+      );
+    } catch (error) {
+      const detalle = error instanceof Error ? error.message : String(error);
+
+      log.error(
+        "Paso de turnos — error ejecutando consultar_disponibilidad",
+        detalle,
+      );
+
+      return {
+        ok: false,
+        motivo: `error ejecutando consultar_disponibilidad: ${detalle}`,
+      };
+    }
+
+    evidencia = formatearEvidenciaDisponibilidad(resultado);
   }
 
   messages.push({
@@ -848,11 +966,7 @@ async function ejecutarToolConsultarDisponibilidad(
     }],
   });
 
-  return {
-    ok: true,
-    evidencia: formatearEvidenciaDisponibilidad(resultado),
-    agendado: false,
-  };
+  return { ok: true, evidencia, agendado: false };
 }
 
 export async function ejecutarPasoTurnos(

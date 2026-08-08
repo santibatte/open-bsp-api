@@ -361,8 +361,60 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                solo la regla abstracta que ya había. Sin cambios de
  *                alcance ni de reglas de seguridad — solo estilo del
  *                bloque 2, que es explícitamente el bloque "ajustable".
+ * v23 (2026-08-08): "gestion_turno" deja de exigir un DÍA puntual — un
+ *                pedido vago pero ACOTADO a una semana ("la semana que
+ *                viene, cualquier tarde", "esta semana a la mañana") ahora
+ *                también entra, en vez de degradar al link genérico de
+ *                "agendar" sin buscar nada. Motivo: Santi probó en vivo
+ *                exactamente ese mensaje, se enojó porque el bot mandó el
+ *                link en vez de ayudar a agendar, y pidió pensar el
+ *                problema "de forma holística, como lo haría un humano" en
+ *                vez de una corrección puntual — ver investigación de código
+ *                real en `proyectos/P05_investigacion_bots/` (repo
+ *                `consultorio_dermatologico`): el patrón encontrado en el
+ *                mejor ejemplo real (`inboxbuddy`, agente de agendamiento
+ *                con Google Calendar real) es que el modelo solo CLASIFICA
+ *                la ambigüedad a un schema chico y acotado — nunca calcula
+ *                fechas ni inventa disponibilidad — y el código resuelve el
+ *                rango real y consulta disponibilidad de verdad. Mismo
+ *                principio que ya regía acá para un día puntual
+ *                (`_shared/fechas.ts`), extendido a una semana
+ *                (`resolverRangoFecha`) + franja horaria opcional
+ *                (`horaEnFranja`). Sigue sin alcanzar un pedido SIN ningún
+ *                anclaje temporal ("cualquier día que tengas", "cuando
+ *                puedas") — ahí no hay nada real que resolver, sigue siendo
+ *                "agendar". Tocados: `SCHEMA_EXPRESION_FECHA_O_RANGO`
+ *                (nueva, solo para "consultar_disponibilidad" —
+ *                "agendar_turno" sigue exigiendo un día puntual, sin
+ *                cambios, reservar nunca acepta un rango), el campo nuevo
+ *                "franja_horaria" de esa misma tool, la regla 5
+ *                (gestion_turno) del redactor, la etapa "agendando" en
+ *                `systemEtapa()`, y el paso 2 de `systemAgenteTurnosEstatico`
+ *                (cómo presentar hasta 3 opciones de día cuando la tool
+ *                devuelve un rango con lugar).
+ *                Golden set (caso nuevo `rango_semana_con_franja_ofrece_
+ *                opciones`, réplica exacta del mensaje real) encontró DOS
+ *                bugs reales en la primera corrida, mismo patrón que
+ *                incidentes anteriores — no eran hipótesis, se vieron 2/2
+ *                veces: (1) con más de una opción en la evidencia, el modelo
+ *                volvía a recalcular por su cuenta el día de semana de la
+ *                segunda opción en vez de copiar el ya resuelto (mismo error
+ *                de fondo que Incidente 9, reaparecido porque antes solo se
+ *                citaba UN día por evidencia) — fix: evidencia en LISTA
+ *                (una línea por opción, con la cita "pedido → turno real"
+ *                REPETIDA en cada línea, no solo la primera) en vez de una
+ *                oración corrida, más una instrucción explícita en el
+ *                prompt del agente de turnos. (2) El fixture de prueba
+ *                mismo tenía un día/horario que el consultorio no atiende
+ *                de verdad (viernes, cuando la FAQ real dice miércoles
+ *                10-15hs y jueves 14-19hs) — el juez lo rechazó
+ *                correctamente cruzándolo contra la FAQ; no era un bug de
+ *                código, era un dato de prueba irreal (`consultarDisponibi
+ *                lidadRango` real nunca devolvería eso, porque Calendly
+ *                solo tiene slots en los días que la doctora realmente
+ *                atiende) — fix: corregir el fixture, no el prompt.
  */
-export const PROMPT_VERSION = 22;
+export const PROMPT_VERSION = 23;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -861,9 +913,15 @@ CÓMO ELEGIR EL "tipo"
    - Pregunta por disponibilidad de un día concreto sin querer agendar
      todavía ("¿tenés lugar el miércoles?", "¿hay algo libre el jueves para
      botox?").
-   Preferencias totalmente vagas sin un día concreto ("a la tarde", "la
-   semana que viene", "cualquier día que tengas") NO alcanzan para este
-   tipo — para eso sigue siendo "agendar" (el link genérico).
+   - Da una preferencia vaga pero ACOTADA a una semana concreta —"esta
+     semana", "la semana que viene"— con o sin franja horaria ("cualquier
+     tarde", "a la mañana"). "La semana que viene, cualquier día por la
+     tarde" YA alcanza: hay una semana real contra la que se puede buscar
+     disponibilidad de verdad, no hace falta un día puntual.
+   Preferencias SIN ningún anclaje temporal —ni un día, ni una semana— ("a
+   la tarde" sola, "cuando tengas lugar", "cualquier día que tengas") siguen
+   sin alcanzar para este tipo: ahí no hay nada real contra qué buscar, sigue
+   siendo "agendar" (el link genérico).
    Qué va en "mensaje": dejalo vacío (""). No redactes nada acá — esto lo
    maneja un paso siguiente que consulta Calendly de verdad. Tu única tarea
    acá es CLASIFICAR bien, nunca inventar ni confirmar un turno vos mismo:
@@ -1362,17 +1420,18 @@ LAS CUATRO ETAPAS:
   sin más. Todavía NO dijo que quiere sacar turno. Es también la etapa por
   defecto cuando no está claro.
 
-"quiere_agendar" — mostró intención de sacar un turno, pero todavía sin un día
-  concreto sobre la mesa. "Quiero sacar un turno", "¿cómo hago para
-  agendar?", "me interesa hacerme el tratamiento, ¿qué tengo que hacer?".
-  También cae acá una preferencia vaga sin día ("a la tarde", "la semana que
-  viene", "cualquier día que tengas").
+"quiere_agendar" — mostró intención de sacar un turno, pero SIN ningún
+  anclaje temporal sobre la mesa —ni un día, ni una semana—. "Quiero sacar un
+  turno", "¿cómo hago para agendar?", "me interesa hacerme el tratamiento,
+  ¿qué tengo que hacer?", "cualquier día que tengas", "cuando tengas lugar".
 
-"agendando" — está en el medio de acordar el turno: apareció un día concreto,
-  un horario, o se están intercambiando los datos (nombre, mail) para
-  cerrarlo. "¿Tenés lugar el miércoles?", "dale, a las 16", "mi mail es
-  X", "sí, ese nombre está bien". También si pregunta por disponibilidad de
-  un día puntual aunque todavía no confirme.
+"agendando" — está en el medio de acordar el turno: apareció un día
+  concreto, un horario, una semana acotada ("la semana que viene", "esta
+  semana") con o sin franja horaria ("cualquier tarde", "a la mañana"), o se
+  están intercambiando los datos (nombre, mail) para cerrarlo. "¿Tenés lugar
+  el miércoles?", "dale, a las 16", "la semana que viene, cualquier día por
+  la tarde", "mi mail es X", "sí, ese nombre está bien". También si pregunta
+  por disponibilidad de un día o una semana aunque todavía no confirme.
 
 "agendado" — el turno YA está confirmado. Se llega acá cuando el bot confirmó
   un turno concreto en un mensaje anterior, o cuando la paciente escribe sobre
@@ -1543,6 +1602,72 @@ const SCHEMA_EXPRESION_FECHA: JSONSchema = {
   additionalProperties: false,
 };
 
+/**
+ * Superset de `SCHEMA_EXPRESION_FECHA` con dos casos de RANGO —
+ * "semana_actual"/"semana_que_viene" — para pedidos vagos pero ACOTADOS a
+ * una semana ("la semana que viene, cualquier tarde"). Solo la usa
+ * "consultar_disponibilidad": "agendar_turno" sigue con
+ * `SCHEMA_EXPRESION_FECHA` sin cambios — reservar un turno siempre necesita
+ * un día puntual, nunca un rango. Ver `_shared/fechas.ts`
+ * (`ExpresionFechaConsulta`/`resolverRangoFecha`) para la resolución real,
+ * siempre en código, nunca calculada por el modelo.
+ */
+const SCHEMA_EXPRESION_FECHA_O_RANGO: JSONSchema = {
+  type: "object",
+  description:
+    "Cómo la paciente indicó CUÁNDO — un día puntual (mismos casos que 'agendar_turno') o, si el " +
+    "pedido fue vago pero acotado a una semana entera, un rango. NUNCA calcules vos una fecha " +
+    "ISO, el código hace la cuenta.",
+  properties: {
+    tipo: {
+      type: "string",
+      enum: [
+        "hoy",
+        "manana",
+        "pasado_manana",
+        "dia_semana",
+        "fecha_explicita",
+        "semana_actual",
+        "semana_que_viene",
+      ],
+      description:
+        "Mismos cinco valores que en 'agendar_turno' para un día puntual, más 'semana_actual' " +
+        "('esta semana', 'cualquier día de esta semana') y 'semana_que_viene' ('la semana que " +
+        "viene', 'la próxima semana') cuando la paciente no dio un día puntual sino una semana " +
+        "entera. Una preferencia SIN ningún anclaje temporal (ni día ni semana) no corresponde a " +
+        "esta tool en absoluto — eso ni siquiera debería llegar acá (ver tipo='agendar' en el " +
+        "redactor).",
+    },
+    dia_semana: {
+      description:
+        "Solo si tipo='dia_semana' — el día que nombró, en minúscula y sin tilde. null en cualquier otro caso.",
+      anyOf: [
+        {
+          type: "string",
+          enum: [
+            "lunes",
+            "martes",
+            "miercoles",
+            "jueves",
+            "viernes",
+            "sabado",
+            "domingo",
+          ],
+        },
+        { type: "null" },
+      ],
+    },
+    fecha_explicita: {
+      description:
+        "Solo si tipo='fecha_explicita' — tal cual lo dijo la paciente, en 'DD/MM' o 'DD/MM/YYYY' " +
+        "(ej. dijo '19 de agosto' → '19/08'). null en cualquier otro caso.",
+      anyOf: [{ type: "string" }, { type: "null" }],
+    },
+  },
+  required: ["tipo", "dia_semana", "fecha_explicita"],
+  additionalProperties: false,
+};
+
 export const TOOL_AGENDAR_TURNO: AnthropicTool = {
   name: "agendar_turno",
   description:
@@ -1622,25 +1747,36 @@ export const TOOL_AGENDAR_TURNO: AnthropicTool = {
 export const TOOL_CONSULTAR_DISPONIBILIDAD: AnthropicTool = {
   name: "consultar_disponibilidad",
   description:
-    "Consulta los horarios REALES libres de un día puntual para un tratamiento, SIN agendar " +
-    "nada. Usala cuando la paciente da un día (fecha, día de la semana, 'mañana') pero todavía " +
-    "no dio una hora puntual, o pregunta directamente si hay lugar tal día. Nunca inventes ni " +
-    "asumas horarios — mostrale a la paciente exactamente la lista de horarios que esta tool " +
-    "te devuelve, para que elija uno. Una vez que elija un horario (en este mensaje o en el " +
-    "próximo), ahí sí llamá a 'agendar_turno' con esa fecha y hora exactas. " +
+    "Consulta los horarios REALES libres de un día puntual, O de una semana completa, para un " +
+    "tratamiento, SIN agendar nada. Usala cuando la paciente da un día (fecha, día de la semana, " +
+    "'mañana') pero todavía no dio una hora puntual, cuando pregunta directamente si hay lugar " +
+    "tal día, o cuando dio una preferencia vaga pero ACOTADA a una semana ('la semana que viene, " +
+    "cualquier tarde', 'esta semana a la mañana') — en ese último caso usá 'fecha'='semana_actual' " +
+    "o 'semana_que_viene' y, si mencionó una franja, 'franja_horaria'. Nunca inventes ni asumas " +
+    "horarios — mostrale a la paciente exactamente lo que esta tool te devuelve, para que elija " +
+    "una opción. Una vez que elija un día y horario puntuales (en este mensaje o en el próximo), " +
+    "ahí sí llamá a 'agendar_turno' con esa fecha y hora exactas. " +
     "'tratamiento_o_tipo_turno': mismo criterio que en 'agendar_turno' — texto libre, la tool " +
     "resuelve sola contra los turnos activos de Calendly; si es ambiguo o no matchea ninguno, " +
     "devuelve motivo='tipo_turno_ambiguo' con el detalle, preguntale a la paciente cuál " +
     "corresponde. " +
-    "'fecha': NUNCA calcules una fecha ISO vos — solo indicá qué día dijo la paciente (día de " +
-    "semana, 'mañana', fecha explícita), el código hace la cuenta. " +
-    "Si el día pedido NO tiene horarios libres, la tool busca en las dos direcciones y devuelve " +
-    "'alternativaAntes' (día más cercano ANTES del pedido, nunca antes de hoy) y " +
-    "'alternativaDespues' (día más cercano DESPUÉS) — cada una con fecha real + horarios reales, " +
-    "o null si no hay nada en esa dirección. Si la paciente pidió específicamente algo más " +
-    "cercano o preguntó '¿y antes?'/'¿no hay algo más pronto?', priorizá 'alternativaAntes'; si " +
-    "no aclaró dirección, ofrecé la que exista (o las dos, si ambas vinieron). Si las dos son " +
-    "null, no hay ninguna alternativa real: decíselo así, sin inventar ningún día.",
+    "'fecha': NUNCA calcules una fecha ISO vos — solo indicá qué día o semana dijo la paciente, " +
+    "el código hace la cuenta. " +
+    "'franja_horaria': 'manana' o 'tarde' si la paciente mencionó una, null si no dijo ninguna " +
+    "(en ese caso se busca en todo el día/rango, sin filtrar). " +
+    "CASO DÍA PUNTUAL — si 'fecha' es un día concreto y NO tiene horarios libres, la tool busca " +
+    "en las dos direcciones y devuelve 'alternativaAntes'/'alternativaDespues' (fecha real + " +
+    "horarios reales cada una, o null si no hay nada en esa dirección). " +
+    "CASO SEMANA — si 'fecha' es 'semana_actual'/'semana_que_viene' y SÍ hay lugar, la tool " +
+    "devuelve 'opciones': hasta 3 días distintos de esa semana con horarios reales (ya filtrados " +
+    "por franja horaria si la diste) — mostraselos como alternativas para que elija una. Si la " +
+    "semana entera NO tiene nada (con el filtro de franja aplicado), devuelve 'sin_horarios_en_" +
+    "rango' con 'alternativaAntes'/'alternativaDespues' — mismo criterio que el caso de día " +
+    "puntual, pero buscando desde los bordes de la semana. " +
+    "En cualquier caso: si la paciente pidió específicamente algo más cercano o preguntó '¿y " +
+    "antes?'/'¿no hay algo más pronto?', priorizá 'alternativaAntes'; si no aclaró dirección, " +
+    "ofrecé la que exista (o las dos, si ambas vinieron). Si las dos son null, no hay ninguna " +
+    "alternativa real: decíselo así, sin inventar ningún día.",
   input_schema: {
     type: "object",
     properties: {
@@ -1649,9 +1785,18 @@ export const TOOL_CONSULTAR_DISPONIBILIDAD: AnthropicTool = {
         description:
           "Descripción corta y libre del tratamiento (ej. 'botox', 'IPL', 'consulta general').",
       },
-      fecha: SCHEMA_EXPRESION_FECHA,
+      fecha: SCHEMA_EXPRESION_FECHA_O_RANGO,
+      franja_horaria: {
+        description:
+          "Franja horaria que pidió la paciente, si mencionó alguna ('a la mañana', 'por la " +
+          "tarde', 'temprano'). null si no especificó ninguna — se busca en todo el día/rango.",
+        anyOf: [
+          { type: "string", enum: ["manana", "tarde"] },
+          { type: "null" },
+        ],
+      },
     },
-    required: ["tratamiento_o_tipo_turno", "fecha"],
+    required: ["tratamiento_o_tipo_turno", "fecha", "franja_horaria"],
     additionalProperties: false,
   },
   strict: true,
@@ -1683,21 +1828,39 @@ Tu única tarea acá es resolver la gestión de un turno puntual:
    cancel_url/reschedule_url real de ESE turno — nunca canceles ni
    reprogrames vos, eso lo hace la paciente desde ese link.
 2. Si la paciente dio un día pero TODAVÍA NO una hora puntual (ej. "¿hay
-   lugar el miércoles?", "quiero para el jueves"), o pregunta directamente
-   por disponibilidad de un día: llamá a la tool "consultar_disponibilidad"
-   con ese día y mostrale la lista real de horarios que te devuelve, para
-   que elija uno. NO llames a "agendar_turno" todavía en este caso — falta
-   que elija hora. Si esa tool te dice que NO hay horarios ese día, decíselo
-   tal cual. Si la tool además te da "alternativaAntes" y/o
+   lugar el miércoles?", "quiero para el jueves"), pregunta directamente por
+   disponibilidad de un día, O dio una preferencia vaga pero ACOTADA a una
+   semana ("la semana que viene, cualquier tarde", "esta semana a la
+   mañana"): llamá a la tool "consultar_disponibilidad" — con ese día, o con
+   "fecha"="semana_actual"/"semana_que_viene" y "franja_horaria" si mencionó
+   una franja — y mostrale la lista real de opciones que te devuelve, para
+   que elija una. NO llames a "agendar_turno" todavía en este caso — falta
+   que elija día y hora puntuales.
+   CASO DÍA PUNTUAL: si esa tool te dice que NO hay horarios ese día,
+   decíselo tal cual. Si además te da "alternativaAntes" y/o
    "alternativaDespues" (día + horarios reales, en cada dirección),
    ofrecésela ("no tengo nada libre el miércoles, pero antes el lunes 12/08
    tengo 9:00, o más adelante el jueves 14/08 tengo 10:00 y 11:30 — ¿te
-   sirve alguno?"). Si la paciente pidió específicamente algo más cercano o
-   "antes", priorizá "alternativaAntes" en tu respuesta. Si las dos vinieron
-   null, no hay ninguna cercana — decilo así, sin ofrecer nada. Nunca
-   nombres vos un día u horario que la tool no te haya dado explícitamente:
-   inventar disponibilidad (aunque sea "el próximo día debería tener lugar")
-   es el error más grave posible acá.
+   sirve alguno?").
+   CASO SEMANA: si la tool te devuelve "opciones" (hasta 3 días de esa
+   semana con horarios reales), presentaselos como alternativas concretas
+   ("para la semana que viene por la tarde tengo: martes 12/08 a las 15:00 o
+   16:30, jueves 14/08 a las 14:00 — ¿cuál te sirve?"). CADA opción de la
+   lista YA trae escrito su día de semana correcto — copialo LETRA POR
+   LETRA, para CADA opción, sin excepción. NUNCA recalcules vos el día de
+   semana de ninguna fecha (ni de la primera opción ni de las siguientes):
+   un LLM no puede hacer esa aritmética de forma confiable, y "la semana que
+   viene" tiene varios días a la vez, así que el riesgo de inventar mal el
+   día de semana de la SEGUNDA o TERCERA opción (aunque la primera esté
+   bien) es real — pasó en pruebas reales. Si en cambio te devuelve
+   "sin_horarios_en_rango", tratalo exactamente igual que el caso sin
+   horarios de un día puntual, con "alternativaAntes"/"alternativaDespues".
+   En cualquier caso: si la paciente pidió específicamente algo más cercano o
+   "antes", priorizá "alternativaAntes" en tu respuesta. Si no hay ninguna
+   alternativa real (todo null), decilo así, sin ofrecer nada. Nunca nombres
+   vos un día u horario que la tool no te haya dado explícitamente: inventar
+   disponibilidad (aunque sea "el próximo día debería tener lugar") es el
+   error más grave posible acá.
 3. Si la paciente quiere agendar un turno nuevo y ya dio (en este mensaje o
    antes en la conversación) un tratamiento Y un día CON hora puntual: llamá
    a la tool "agendar_turno" — pero SOLO si además ya tenés su mail (mostrado

@@ -187,6 +187,100 @@ export function validarHoraHHMM(hora: string): boolean {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(hora);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// RANGO DE FECHA (2026-08-08) — para pedidos vagos pero ACOTADOS a una
+// semana ("la semana que viene, cualquier tarde"), que hasta acá caían
+// directo al link genérico de Calendly sin buscar disponibilidad real. Ver
+// `proyectos/P05_investigacion_bots` (repo `consultorio_dermatologico`) para
+// la investigación que motivó este diseño: el patrón real encontrado
+// (`inboxbuddy`) es que el modelo solo CLASIFICA la ambigüedad a un schema
+// acotado (nunca calcula fechas), y el código resuelve el rango real y
+// consulta disponibilidad de verdad — mismo espíritu que
+// `resolverFechaExpresion` para un día puntual, extendido a una semana.
+//
+// Deliberadamente chico: solo dos rangos (semana actual / semana que viene),
+// no un parser de rango libre — alcanza para el caso real encontrado y evita
+// construir algo más general de lo que hace falta.
+// ═══════════════════════════════════════════════════════════════════════
+
+export type FranjaHoraria = "manana" | "tarde";
+
+/** Shape que llena el modelo para `consultar_disponibilidad` — superset de
+ * `ExpresionFecha` (un día puntual sigue siendo válido) más dos casos de
+ * RANGO. Nunca se usa para `agendar_turno`: reservar siempre necesita un día
+ * puntual, así que esa tool sigue con `ExpresionFecha` sin cambios. */
+export type ExpresionFechaConsulta =
+  | ExpresionFecha
+  | { tipo: "semana_actual" }
+  | { tipo: "semana_que_viene" };
+
+export type ResultadoResolverRango =
+  | { ok: true; inicioISO: string; finISO: string }
+  | { ok: false; motivo: string };
+
+/** Suma (o resta, con `dias` negativo) días de calendario a un día
+ * "YYYY-MM-DD" — mismo criterio de anclaje al mediodía que el resto del
+ * archivo (ver `anclarAlMediodia`), para no repetir el bug de timezone ya
+ * documentado en `_shared/calendly.ts`. */
+function sumarDiasISO(diaISO: string, dias: number): string {
+  return fechaLocalISO(
+    new Date(anclarAlMediodia(diaISO).getTime() + dias * 86_400_000),
+  );
+}
+
+/** Lunes de la semana (Argentina: la semana arranca lunes) que contiene
+ * `diaISO`. */
+function lunesDeSemana(diaISO: string): string {
+  const dow = anclarAlMediodia(diaISO).getDay(); // 0 = domingo ... 6 = sábado
+  const deltaHastaLunes = dow === 0 ? -6 : 1 - dow;
+  return sumarDiasISO(diaISO, deltaHastaLunes);
+}
+
+/**
+ * Resuelve un rango de fecha contra una fecha ancla (`ahora`) — mismo
+ * principio que `resolverFechaExpresion`: el modelo nunca calcula el rango,
+ * solo dice "esta semana" o "la semana que viene" y esto hace la cuenta.
+ * Un día puntual (`ExpresionFecha`) se delega a `resolverFechaExpresion` y
+ * vuelve como un rango de un solo día (`inicioISO === finISO`).
+ *
+ * "semana_actual" arranca HOY, nunca antes — no tiene sentido buscar
+ * disponibilidad en un día ya pasado de la semana en curso.
+ */
+export function resolverRangoFecha(
+  expr: ExpresionFechaConsulta,
+  ahora: Date,
+): ResultadoResolverRango {
+  const hoyISO = fechaLocalISO(ahora);
+
+  if (expr.tipo === "semana_actual") {
+    const domingoDeEstaSemana = sumarDiasISO(lunesDeSemana(hoyISO), 6);
+    return { ok: true, inicioISO: hoyISO, finISO: domingoDeEstaSemana };
+  }
+
+  if (expr.tipo === "semana_que_viene") {
+    const lunesQueViene = sumarDiasISO(lunesDeSemana(hoyISO), 7);
+    return {
+      ok: true,
+      inicioISO: lunesQueViene,
+      finISO: sumarDiasISO(lunesQueViene, 6),
+    };
+  }
+
+  const resuelto = resolverFechaExpresion(expr, ahora);
+
+  return resuelto.ok
+    ? { ok: true, inicioISO: resuelto.fechaISO, finISO: resuelto.fechaISO }
+    : resuelto;
+}
+
+/** ¿Una hora "HH:MM" cae en la franja pedida? Corte simple al mediodía
+ * (12:59 es "mañana", 13:00 es "tarde") — no hay ninguna fuente que defina
+ * un corte distinto, y es el criterio más intuitivo para una paciente. */
+export function horaEnFranja(horaHHMM: string, franja: FranjaHoraria): boolean {
+  const hh = Number(horaHHMM.slice(0, 2));
+  return franja === "manana" ? hh < 13 : hh >= 13;
+}
+
 /** Arma el ISO con offset que espera Calendly — el ÚNICO lugar que
  * combina fecha ya resuelta + hora ya validada, nunca el modelo. */
 export function construirFechaHoraISO(

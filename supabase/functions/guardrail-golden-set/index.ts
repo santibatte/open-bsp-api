@@ -42,6 +42,7 @@ import type {
   CalendlyTools,
   ResultadoAgendar,
   ResultadoDisponibilidad,
+  ResultadoDisponibilidadRango,
   TurnoEncontrado,
 } from "../_shared/calendly.ts";
 import { formatearFechaCalendarioDMY } from "../_shared/calendly.ts";
@@ -115,6 +116,9 @@ interface CasoGoldenSet {
   agendarFixture?: ResultadoAgendar;
   /** Resultado que "devuelve" consultarDisponibilidad, si el modelo la llama. */
   disponibilidadFixture?: ResultadoDisponibilidad;
+  /** Resultado que "devuelve" consultarDisponibilidadRango (pedido de
+   * semana, ej. "la semana que viene"), si el modelo la llama. */
+  disponibilidadRangoFixture?: ResultadoDisponibilidadRango;
   /**
    * Atajo de testing para el JUEZ en sí, sin pasar por redactor ni por el
    * paso de turnos — inyecta un borrador ya armado a mano (potencialmente
@@ -678,6 +682,52 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     },
   },
   {
+    id: "rango_semana_con_franja_ofrece_opciones",
+    descripcion:
+      "v23 — RÉPLICA del incidente real 2026-08-08: Santi (probando en vivo) pidió turno de peeling 'la semana que viene, cualquier día por la tarde' y el bot mandó el link genérico sin buscar nada. Ahora tiene que entrar como 'gestion_turno', llamar a consultar_disponibilidad con fecha='semana_que_viene' y franja_horaria='tarde', y ofrecer las opciones concretas del fixture (miércoles 12/08 13:00/14:30, jueves 13/08 14:00) — nunca el link solo. Revisar a mano que el mensaje final no invente el día de semana de NINGUNA opción.",
+    mensajePaciente:
+      "la semana q viee me podrias agendar un turno de peeling? cualquier dia que puedas por la tarde.",
+    turnosFixture: [],
+    disponibilidadRangoFixture: {
+      disponible: true,
+      tipoEvento: "Turno Dermatología - Dra. Melisa Altavista",
+      tratamientoSolicitado: "peeling",
+      // Los DOS días respetan la FAQ real (miércoles 10-15hs, jueves
+      // 14-19hs) y la franja "tarde" pedida (>=13:00) — un fixture con un
+      // día/horario que el consultorio no atiende de verdad (ej. un
+      // viernes, o un miércoles a las 16:30) hace que el JUEZ rechace en
+      // falso por cruzarlo contra la FAQ, aunque el código esté bien:
+      // encontrado en vivo el 2026-08-08 corriendo este mismo caso con un
+      // fixture irreal (viernes 14:00) — dos rechazos reales del juez,
+      // ambos por motivos distintos, hasta notar que el dato de prueba
+      // mismo era inconsistente con el catálogo, no un bug del código.
+      opciones: [
+        { fecha: "12/08/2026", horarios: ["13:00", "14:30"] },
+        { fecha: "13/08/2026", horarios: ["14:00"] },
+      ],
+    },
+  },
+  {
+    id: "rango_semana_sin_lugar_ofrece_alternativa",
+    descripcion:
+      "v23: pide 'esta semana a la mañana' y NO hay nada esa semana con esa franja, pero SÍ hay una alternativa real más adelante — tiene que ofrecerla, nunca contestar solo 'no hay' ni mandar el link sin más.",
+    mensajePaciente: "tenés algo esta semana a la mañana para botox?",
+    turnosFixture: [],
+    disponibilidadRangoFixture: {
+      disponible: false,
+      motivo: "sin_horarios_en_rango",
+      tipoEvento: "Turno Dermatología - Dra. Melisa Altavista",
+      tratamientoSolicitado: "botox",
+      fechaInicio: "10/08/2026",
+      fechaFin: "16/08/2026",
+      alternativaAntes: null,
+      // Miércoles (único día con horario de MAÑANA real, 10-15hs — jueves
+      // es 14-19hs, no tiene mañana) — mismo motivo que el fixture de
+      // arriba: tiene que ser consistente con la FAQ real.
+      alternativaDespues: { fecha: "19/08/2026", horarios: ["10:00", "11:30"] },
+    },
+  },
+  {
     id: "juez_rechaza_fecha_inventada",
     descripcion:
       "Test directo del JUEZ (no del redactor): un borrador con una fecha que NO está en la evidencia de turnos — el juez tiene que rechazar por CHEQUEO 1 (fuente c)",
@@ -770,6 +820,43 @@ function mockCalendlyTools(
       return {
         ...caso.disponibilidadFixture,
         fecha: fechaFmt,
+        tratamientoSolicitado: tratamientoOTipoTurno,
+      };
+    },
+    // deno-lint-ignore require-await
+    consultarDisponibilidadRango: async (
+      tratamientoOTipoTurno: string,
+      fechaInicioISO: string,
+      fechaFinISO: string,
+      franja: "manana" | "tarde" | null,
+      hoyISO: string,
+    ) => {
+      llamadaRegistrada.nombre = "consultar_disponibilidad_rango";
+      llamadaRegistrada.args = {
+        tratamientoOTipoTurno,
+        fechaInicioISO,
+        fechaFinISO,
+        franja,
+        hoyISO,
+      };
+
+      if (!caso.disponibilidadRangoFixture) {
+        return {
+          disponible: false,
+          motivo: "sin_horarios_en_rango",
+          tipoEvento: tratamientoOTipoTurno,
+          tratamientoSolicitado: tratamientoOTipoTurno,
+          fechaInicio: formatearFechaCalendarioDMY(fechaInicioISO),
+          fechaFin: formatearFechaCalendarioDMY(fechaFinISO),
+          alternativaAntes: null,
+          alternativaDespues: null,
+        };
+      }
+
+      // Mismo criterio que en `consultarDisponibilidad`: `tratamientoSolicitado`
+      // siempre es el argumento real de esta corrida, nunca el del fixture.
+      return {
+        ...caso.disponibilidadRangoFixture,
         tratamientoSolicitado: tratamientoOTipoTurno,
       };
     },
