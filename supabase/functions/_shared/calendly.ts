@@ -103,13 +103,23 @@ export type ResultadoDisponibilidad =
     tipoEvento: string;
     fecha: string;
     tratamientoSolicitado: string;
-    /** Día más cercano con disponibilidad REAL dentro de la ventana
-     * ampliada (segunda consulta real a Calendly, nunca inventado) — `null`
-     * si tampoco hay nada en los próximos días. Agregada 2026-08-07,
-     * pedido explícito de Santi: antes de esto, si no había lugar el día
-     * pedido, el prompt le prohibía al modelo ofrecer cualquier alternativa
-     * porque no había datos reales para respaldarla. */
-    alternativa: { fecha: string; horarios: string[] } | null;
+    /** Día más cercano con disponibilidad REAL, buscando hacia DELANTE
+     * desde el día pedido (segunda consulta real a Calendly, nunca
+     * inventado) — `null` si tampoco hay nada en los próximos días.
+     * Agregada 2026-08-07, pedido explícito de Santi: antes de esto, si no
+     * había lugar el día pedido, el prompt le prohibía al modelo ofrecer
+     * cualquier alternativa porque no había datos reales para respaldarla. */
+    alternativaDespues: { fecha: string; horarios: string[] } | null;
+    /** Día más cercano con disponibilidad REAL, buscando hacia ATRÁS desde
+     * el día pedido, nunca antes de hoy (tercera consulta real a Calendly)
+     * — `null` si no hay nada entre hoy y el día pedido. Agregada
+     * 2026-08-08 (Incidente real: Santi pidió el 21/08, no había lugar, se
+     * le ofreció el 2/09, y al preguntar "¿y antes no tenés?" el bot no
+     * tenía forma de buscar hacia atrás — la búsqueda de alternativa era
+     * siempre unidireccional). `consultar_disponibilidad` es código
+     * nuestro, no una limitación de Calendly — no hay motivo para no
+     * buscar en las dos direcciones desde el vamos. */
+    alternativaAntes: { fecha: string; horarios: string[] } | null;
   };
 
 export interface CalendlyTools {
@@ -127,6 +137,10 @@ export interface CalendlyTools {
   consultarDisponibilidad(
     tratamientoOTipoTurno: string,
     fechaDeseada: string,
+    /** Día calendario de HOY en Buenos Aires ("YYYY-MM-DD") — nunca se
+     * busca una alternativa "antes" anterior a este día, no tiene sentido
+     * ofrecer un turno en el pasado. */
+    hoyISO: string,
   ): Promise<ResultadoDisponibilidad>;
   agendarTurno(args: AgendarArgs): Promise<ResultadoAgendar>;
 }
@@ -654,13 +668,17 @@ async function horariosDisponibles(
 }
 
 /** Agrupa horarios (ya devueltos por Calendly, con offset real) por día
- * calendario de Buenos Aires y devuelve el primero, en orden cronológico,
- * que tenga al menos un horario libre — la "alternativa más cercana" real,
- * nunca inventada. `null` si ninguno de los horarios de la ventana cae en un
- * día distinto al ya descartado (`diaExcluidoISO`). */
-function primerDiaConHorarios(
+ * calendario de Buenos Aires y devuelve el más cercano al día descartado
+ * (`diaExcluidoISO`) que tenga al menos un horario libre — la "alternativa
+ * más cercana" real, nunca inventada. `orden = "asc"` devuelve el primero
+ * cronológicamente (para buscar hacia DELANTE); `orden = "desc"` devuelve el
+ * último (para buscar hacia ATRÁS, el más cercano al día pedido veniendo
+ * desde antes). `null` si ningún horario de la ventana cae en un día
+ * distinto al ya descartado. */
+function diaConHorariosMasCercano(
   horarios: { start_time: string }[],
   diaExcluidoISO: string,
+  orden: "asc" | "desc",
 ): { fecha: string; horarios: string[] } | null {
   const porDia = new Map<string, string[]>();
 
@@ -679,11 +697,13 @@ function primerDiaConHorarios(
 
   if (!diasOrdenados.length) return null;
 
-  const primerDia = diasOrdenados[0];
+  const elegido = orden === "asc"
+    ? diasOrdenados[0]
+    : diasOrdenados[diasOrdenados.length - 1];
 
   return {
-    fecha: formatearFechaCalendarioDMY(primerDia),
-    horarios: porDia.get(primerDia)!,
+    fecha: formatearFechaCalendarioDMY(elegido),
+    horarios: porDia.get(elegido)!,
   };
 }
 
@@ -794,15 +814,36 @@ async function agendarTurno(
 // link genérico. Solo lectura — nunca agenda nada.
 // ─────────────────────────────────────────────────────────────────────────
 
-/** Ventana hacia adelante que se consulta buscando la alternativa más
+/** Ventana que se consulta (para cada lado) buscando la alternativa más
  * cercana cuando el día pedido no tiene nada — bien por debajo del máximo
  * real de 31 días que permite `/event_type_available_times` (confirmado
  * contra la doc oficial de Calendly), da ~2 semanas de margen. */
 const VENTANA_ALTERNATIVAS_DIAS = 14;
 
+/** Suma (o resta, con `dias` negativo) días de calendario a una fecha
+ * "YYYY-MM-DD", devolviendo otra fecha "YYYY-MM-DD" — string puro entrando y
+ * saliendo, el único `Date` intermedio tiene hora+offset explícitos así que
+ * no hay ambigüedad de día (mismo criterio que el resto del archivo, ver
+ * `formatearFechaCalendarioDMY`). */
+function sumarDias(fechaISO: string, dias: number): string {
+  const d = new Date(`${fechaISO}T00:00:00-03:00`);
+  d.setTime(d.getTime() + dias * 86_400_000);
+  return fechaLocalISO(d);
+}
+
+/** Cantidad de días de calendario entre dos fechas "YYYY-MM-DD" (`b - a`,
+ * ambas a medianoche de Buenos Aires) — para dimensionar la ventana hacia
+ * atrás sin pasarse del día pedido. */
+function diasEntre(aISO: string, bISO: string): number {
+  const a = new Date(`${aISO}T00:00:00-03:00`);
+  const b = new Date(`${bISO}T00:00:00-03:00`);
+  return Math.round((b.getTime() - a.getTime()) / 86_400_000);
+}
+
 async function consultarDisponibilidad(
   tratamientoOTipoTurno: string,
   fechaDeseada: string,
+  hoyISO: string,
   opts: ClienteOpts,
 ): Promise<ResultadoDisponibilidad> {
   const resuelto = await resolverTipoTurno(tratamientoOTipoTurno, opts);
@@ -825,22 +866,50 @@ async function consultarDisponibilidad(
   const fechaFmt = formatearFechaCalendarioDMY(fechaDeseada);
 
   if (!disponibles.length) {
-    const diaSiguiente = new Date(`${fechaDeseada}T00:00:00-03:00`);
-    diaSiguiente.setTime(diaSiguiente.getTime() + 86_400_000);
-
-    const horariosVentana = await horariosDisponibles(
+    // Hacia DELANTE: sin cambios de fondo respecto de la versión anterior.
+    const horariosVentanaDespues = await horariosDisponibles(
       tipo.uri,
-      fechaLocalISO(diaSiguiente),
+      sumarDias(fechaDeseada, 1),
       opts,
       VENTANA_ALTERNATIVAS_DIAS,
     );
+
+    // Hacia ATRÁS: agregado 2026-08-08 — `consultar_disponibilidad` es
+    // código nuestro, no una limitación de Calendly, así que no hay motivo
+    // para que la búsqueda de alternativa sea unidireccional (ver Incidente
+    // real: Santi preguntó "¿y antes no tenés?" y el bot no tenía forma de
+    // buscarlo). Nunca se busca antes de hoy — no tiene sentido ofrecer un
+    // turno en el pasado.
+    const inicioAntesISO = (() => {
+      const candidato = sumarDias(fechaDeseada, -VENTANA_ALTERNATIVAS_DIAS);
+      return candidato < hoyISO ? hoyISO : candidato;
+    })();
+    const diasVentanaAntes = diasEntre(inicioAntesISO, fechaDeseada);
+
+    const horariosVentanaAntes = diasVentanaAntes > 0
+      ? await horariosDisponibles(
+        tipo.uri,
+        inicioAntesISO,
+        opts,
+        diasVentanaAntes,
+      )
+      : [];
 
     return {
       disponible: false,
       motivo: "sin_horarios_ese_dia",
       tipoEvento: tipo.nombre,
       fecha: fechaFmt,
-      alternativa: primerDiaConHorarios(horariosVentana, fechaDeseada),
+      alternativaDespues: diaConHorariosMasCercano(
+        horariosVentanaDespues,
+        fechaDeseada,
+        "asc",
+      ),
+      alternativaAntes: diaConHorariosMasCercano(
+        horariosVentanaAntes,
+        fechaDeseada,
+        "desc",
+      ),
       tratamientoSolicitado: tratamientoOTipoTurno,
     };
   }
@@ -870,8 +939,13 @@ export function crearCalendlyTools(
   return {
     consultarTurno: (telefono, diasAdelante = 90) =>
       consultarTurno(telefono, diasAdelante, clienteOpts),
-    consultarDisponibilidad: (tratamientoOTipoTurno, fechaDeseada) =>
-      consultarDisponibilidad(tratamientoOTipoTurno, fechaDeseada, clienteOpts),
+    consultarDisponibilidad: (tratamientoOTipoTurno, fechaDeseada, hoyISO) =>
+      consultarDisponibilidad(
+        tratamientoOTipoTurno,
+        fechaDeseada,
+        hoyISO,
+        clienteOpts,
+      ),
     agendarTurno: (args) => agendarTurno(args, clienteOpts),
   };
 }

@@ -32,6 +32,7 @@ import type {
 import {
   fechaActualLegible,
   fechaConDiaSemana,
+  fechaLocalISO,
 } from "../../_shared/calendly.ts";
 import {
   type ExpresionFecha,
@@ -419,13 +420,25 @@ function formatearEvidenciaDisponibilidad(
         fechaConDiaSemana(resultado.fecha)
       }. Ese día está SIN LUGAR: decir que hay disponibilidad ese día sería inventarlo.`;
 
-    if (!resultado.alternativa) {
-      return `${base} No hay disponibilidad tampoco en los próximos días — no menciones ningún día ni fecha como alternativa; si querés, podés preguntarle a la paciente si quiere que consultes otro día, sin nombrar cuál.`;
+    const antes = resultado.alternativaAntes
+      ? `antes, el ${fechaConDiaSemana(resultado.alternativaAntes.fecha)} (${
+        resultado.alternativaAntes.horarios.join(", ")
+      })`
+      : null;
+    const despues = resultado.alternativaDespues
+      ? `más adelante, el ${
+        fechaConDiaSemana(resultado.alternativaDespues.fecha)
+      } (${resultado.alternativaDespues.horarios.join(", ")})`
+      : null;
+    const alternativas = [antes, despues].filter((x): x is string => !!x);
+
+    if (!alternativas.length) {
+      return `${base} No hay disponibilidad real tampoco en los próximos ni en los días anteriores (ambas direcciones ya consultadas) — no menciones ningún día ni fecha como alternativa; si querés, podés preguntarle a la paciente si quiere que consultes otro día, sin nombrar cuál.`;
     }
 
-    return `${base} Alternativa real más cercana: ${
-      fechaConDiaSemana(resultado.alternativa.fecha)
-    }, horarios ${resultado.alternativa.horarios.join(", ")}.`;
+    return `${base} Alternativa(s) real(es) más cercana(s) — ${
+      alternativas.join("; ")
+    }.`;
   }
 
   return `consultar_disponibilidad: tipo de turno ambiguo — ${resultado.detalle}`;
@@ -801,6 +814,7 @@ async function ejecutarToolConsultarDisponibilidad(
     resultado = await tools.consultarDisponibilidad(
       tratamiento,
       resuelta.fechaISO,
+      fechaLocalISO(ahora),
     );
   } catch (error) {
     const detalle = error instanceof Error ? error.message : String(error);

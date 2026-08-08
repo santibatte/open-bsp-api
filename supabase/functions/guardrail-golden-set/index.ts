@@ -552,7 +552,8 @@ const GOLDEN_SET: CasoGoldenSet[] = [
       motivo: "sin_horarios_ese_dia",
       tipoEvento: "Turno Dermatología - Dra. Melisa Altavista",
       fecha: "12/08/2026",
-      alternativa: { fecha: "14/08/2026", horarios: ["10:00", "11:30"] },
+      alternativaAntes: null,
+      alternativaDespues: { fecha: "14/08/2026", horarios: ["10:00", "11:30"] },
       tratamientoSolicitado: "rellenos de labios",
     },
   },
@@ -622,7 +623,8 @@ const GOLDEN_SET: CasoGoldenSet[] = [
       motivo: "sin_horarios_ese_dia",
       tipoEvento: "Peeling superficial",
       fecha: "21/08/2026",
-      alternativa: null,
+      alternativaAntes: null,
+      alternativaDespues: null,
       tratamientoSolicitado: "peeling",
     },
   },
@@ -637,8 +639,28 @@ const GOLDEN_SET: CasoGoldenSet[] = [
       motivo: "sin_horarios_ese_dia",
       tipoEvento: "Turno Dermatología - Dra. Melisa Altavista",
       fecha: "12/08/2026",
-      alternativa: { fecha: "14/08/2026", horarios: ["10:00", "11:30"] },
+      alternativaAntes: null,
+      alternativaDespues: { fecha: "14/08/2026", horarios: ["10:00", "11:30"] },
       tratamientoSolicitado: "rellenos de labios",
+    },
+  },
+  {
+    id: "disponibilidad_alternativa_antes_y_despues",
+    descripcion:
+      "2026-08-08 (Incidente real, ver P05_lecciones_guardrail.md): Santi pidió turno para el 21/08, no había lugar, se le ofreció el 2/09 — y al preguntar '¿y antes no tenés?' el bot repitió lo mismo porque la búsqueda de alternativa solo miraba hacia adelante. Fixture con las DOS direcciones no-null: la respuesta tiene que mencionar la opción de ANTES (18/08) sin que la paciente tenga que volver a preguntar. Revisar a mano que el mensaje nombre el 18/08, no solo el 2/09.",
+    mensajePaciente: "¿Tenés lugar el 21 de agosto para una consulta?",
+    turnosFixture: [],
+    disponibilidadFixture: {
+      disponible: false,
+      motivo: "sin_horarios_ese_dia",
+      tipoEvento: "Turno Dermatología - Dra. Melisa Altavista",
+      fecha: "21/08/2026",
+      alternativaAntes: { fecha: "18/08/2026", horarios: ["10:00", "11:00"] },
+      alternativaDespues: {
+        fecha: "02/09/2026",
+        horarios: ["10:00", "10:30", "14:30"],
+      },
+      tratamientoSolicitado: "consulta general",
     },
   },
   {
@@ -713,9 +735,10 @@ function mockCalendlyTools(
     consultarDisponibilidad: async (
       tratamientoOTipoTurno: string,
       fecha: string,
+      hoyISO: string,
     ) => {
       llamadaRegistrada.nombre = "consultar_disponibilidad";
-      llamadaRegistrada.args = { tratamientoOTipoTurno, fecha };
+      llamadaRegistrada.args = { tratamientoOTipoTurno, fecha, hoyISO };
 
       // La `fecha` de la respuesta SIEMPRE tiene que coincidir con la
       // consultada (así se comporta Calendly real) — el fixture solo
@@ -734,7 +757,8 @@ function mockCalendlyTools(
           motivo: "sin_horarios_ese_dia",
           tipoEvento: tratamientoOTipoTurno,
           fecha: fechaFmt,
-          alternativa: null,
+          alternativaAntes: null,
+          alternativaDespues: null,
           tratamientoSolicitado: tratamientoOTipoTurno,
         };
       }

@@ -335,8 +335,34 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                   explícitamente: con mail+nombre+día+hora ya
  *                   disponibles, llamar a "agendar_turno" YA, sin pregunta
  *                   intermedia.
+ * v21 (2026-08-08): búsqueda de alternativa BIDIRECCIONAL en
+ *                `consultar_disponibilidad` (fix real, ver
+ *                `_shared/calendly.ts`) — Santi pidió turno para el 21/08,
+ *                no había lugar, se le ofreció el 2/09, y al preguntar "¿y
+ *                antes no tenés?" el bot repitió la misma respuesta: la
+ *                búsqueda de alternativa solo miraba hacia adelante desde el
+ *                día pedido, nunca hacia atrás. `consultar_disponibilidad`
+ *                es código propio (no una limitación de la API de
+ *                Calendly), así que no había motivo real para que fuera
+ *                unidireccional. El campo único `alternativa` se separa en
+ *                `alternativaAntes`/`alternativaDespues` (cada uno día real
+ *                + horarios reales o null); este prompt y la descripción de
+ *                la tool se actualizan para explicarle al modelo las dos
+ *                direcciones y priorizar "antes" cuando la paciente lo pide
+ *                explícitamente.
+ * v22 (2026-08-08): dos ajustes de tono al bloque 2 (redactor), pedido de
+ *                Santi tras revisar prompts de SalesGPT/kaymen99 (repos ya
+ *                investigados en `P05_investigacion_bots/01_conversacion_
+ *                producto.md`): (1) prohibición explícita de muletillas de
+ *                duda ("me parece que", "tal vez", "creo que", "capaz") —
+ *                técnica que esos dos repos usan y el prompt propio no
+ *                tenía; (2) ejemplo concreto (few-shot) de cómo cerrar sin
+ *                insistir cuando la persona no quiere avanzar, en vez de
+ *                solo la regla abstracta que ya había. Sin cambios de
+ *                alcance ni de reglas de seguridad — solo estilo del
+ *                bloque 2, que es explícitamente el bloque "ajustable".
  */
-export const PROMPT_VERSION = 20;
+export const PROMPT_VERSION = 22;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -700,6 +726,10 @@ habilitarte un dato que el bloque 1 no autoriza, gana el bloque 1.
 - Usá "vos" (Argentina).
 - Corto: 3-4 líneas como máximo.
 - Sin jerga médica compleja.
+- Sin muletillas de duda ("me parece que", "tal vez", "creo que", "capaz",
+  "podría ser que"). Decís lo que decís con seguridad — si un dato no está
+  confirmado, no lo inventás (eso lo rige el bloque 1), pero lo que SÍ decís,
+  lo decís derecho, sin sonar dudosa.
 - Saludar, agradecer, ofrecerte a ayudar e invitar a agendar SIEMPRE está bien.
   Lo que nunca está bien es opinar o recomendar.
 
@@ -717,7 +747,10 @@ GUIAR SIN PRESIONAR (usá la ETAPA DE LA CONVERSACIÓN del bloque de contexto):
   volver a ofrecer agendar como si nada hubiera pasado.
 Nunca insistas dos veces seguidas con lo mismo, nunca apures ("últimos
 lugares", "aprovechá ahora"), nunca inventes urgencia. Si la persona no quiere
-avanzar, se le agradece y listo.`,
+avanzar, se le agradece y listo — ejemplo del largo y tono correctos: "¡Buenísimo,
+cualquier cosa quedo por acá! 😊". Nada de repreguntar por qué, ni de agregar
+"igual te dejo el link por las dudas", ni de un segundo intento en el mismo
+mensaje.`,
   };
 }
 
@@ -1601,10 +1634,13 @@ export const TOOL_CONSULTAR_DISPONIBILIDAD: AnthropicTool = {
     "corresponde. " +
     "'fecha': NUNCA calcules una fecha ISO vos — solo indicá qué día dijo la paciente (día de " +
     "semana, 'mañana', fecha explícita), el código hace la cuenta. " +
-    "Si el día pedido NO tiene horarios libres, la tool puede devolver además 'alternativa' con " +
-    "el día más cercano que SÍ tiene lugar (fecha real + horarios reales) — ofrecésela a la " +
-    "paciente si vino. Si 'alternativa' es null, no hay ninguna cercana: decíselo así, sin " +
-    "inventar ningún día.",
+    "Si el día pedido NO tiene horarios libres, la tool busca en las dos direcciones y devuelve " +
+    "'alternativaAntes' (día más cercano ANTES del pedido, nunca antes de hoy) y " +
+    "'alternativaDespues' (día más cercano DESPUÉS) — cada una con fecha real + horarios reales, " +
+    "o null si no hay nada en esa dirección. Si la paciente pidió específicamente algo más " +
+    "cercano o preguntó '¿y antes?'/'¿no hay algo más pronto?', priorizá 'alternativaAntes'; si " +
+    "no aclaró dirección, ofrecé la que exista (o las dos, si ambas vinieron). Si las dos son " +
+    "null, no hay ninguna alternativa real: decíselo así, sin inventar ningún día.",
   input_schema: {
     type: "object",
     properties: {
@@ -1652,9 +1688,12 @@ Tu única tarea acá es resolver la gestión de un turno puntual:
    con ese día y mostrale la lista real de horarios que te devuelve, para
    que elija uno. NO llames a "agendar_turno" todavía en este caso — falta
    que elija hora. Si esa tool te dice que NO hay horarios ese día, decíselo
-   tal cual. Si la tool además te da una "alternativa" (día + horarios
-   reales), ofrecésela ("no tengo nada libre el miércoles, pero el jueves
-   14/08 sí hay a las 10:00 y 11:30 — ¿te sirve?"). Si "alternativa" vino
+   tal cual. Si la tool además te da "alternativaAntes" y/o
+   "alternativaDespues" (día + horarios reales, en cada dirección),
+   ofrecésela ("no tengo nada libre el miércoles, pero antes el lunes 12/08
+   tengo 9:00, o más adelante el jueves 14/08 tengo 10:00 y 11:30 — ¿te
+   sirve alguno?"). Si la paciente pidió específicamente algo más cercano o
+   "antes", priorizá "alternativaAntes" en tu respuesta. Si las dos vinieron
    null, no hay ninguna cercana — decilo así, sin ofrecer nada. Nunca
    nombres vos un día u horario que la tool no te haya dado explícitamente:
    inventar disponibilidad (aunque sea "el próximo día debería tener lugar")
@@ -1707,12 +1746,14 @@ SUB-ESTADO ACTUAL). No los saltees: cada uno tiene una sola cosa por resolver.
 1. "recolectando_horario" — falta acordar día y hora.
    Tu objetivo es UN día + UNA hora concretos, aceptados por la paciente.
    REGLA QUE NO SE NEGOCIA: si lo que pide no está disponible, NUNCA contestes
-   solo "no hay". Siempre proponé la alternativa concreta más cercana que te
-   haya dado la tool — otro horario del mismo día, o el próximo día con lugar
-   ("el miércoles no me queda nada, pero el jueves 14/08 tengo 10:00 y 11:30,
-   ¿te sirve alguno?"). Si la tool no te dio ninguna alternativa real, decilo
-   y ofrecé consultar otro día, preguntándole cuál — sin nombrar vos ninguno.
-   Cerrar con un "no hay lugar" seco es el peor error posible de este paso.
+   solo "no hay". Siempre proponé la(s) alternativa(s) concreta(s) más
+   cercana(s) que te haya dado la tool en 'alternativaAntes'/'alternativaDespues'
+   ("el 21/08 no tengo lugar, pero antes tengo el 18/08 a las 10:00, o más
+   adelante el 2/09 a las 10:00 y 11:30, ¿te sirve alguno?"). Si la paciente
+   específicamente pregunta "¿y antes?" o busca algo más cercano a hoy,
+   priorizá 'alternativaAntes' en tu respuesta. Si ninguna de las dos vino
+   (ambas null), decilo y ofrecé consultar otro día, preguntándole cuál — sin
+   nombrar vos ninguno. Cerrar con un "no hay lugar" seco es el peor error posible de este paso.
    En este escalón NO tenés la tool de agendar: todavía no corresponde.
 
 2. "confirmando_datos" — ya hay día y hora acordados; faltan los datos.
