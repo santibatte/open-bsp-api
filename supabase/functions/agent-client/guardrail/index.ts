@@ -1,19 +1,28 @@
 /**
  * Guardrail redactor + juez — Consultorio de la Vampiresa Meli.
  *
- * Reemplaza el bucle ReAct genérico por un pipeline determinístico de DOS
- * llamados a Claude por cada mensaje entrante:
+ * Pipeline determinístico por cada mensaje entrante (v16):
  *
- *   1. REDACTOR  clasifica y redacta   → { tipo, mensaje }
- *   2. JUEZ      aprueba o rechaza     → { aprobado, motivo }
+ *   0. ETAPA     clasifica la conversación  → { etapa }        (etapa.ts)
+ *   1. REDACTOR  clasifica y redacta        → { tipo, mensaje, datos_detectados }
+ *   1b. AGENTE DE TURNOS (condicional) solo si tipo="gestion_turno" — corre
+ *       en `guardrail/turnos.ts`, con tools reales contra Calendly y gating
+ *       por sub-estado de agendamiento.
+ *   2. JUEZ      aprueba o rechaza          → { aprobado, motivo }
+ *   2b. REESCRITURA (condicional) si el juez rechazó: UN intento de corregir
+ *       el motivo puntual, y el juez revisa esa versión. Segundo rechazo =
+ *       silencio real.
  *
- * Ambos con JSON forzado por schema (output_config.format, Messages API nativa
- * — ver el comentario largo en anthropic.ts sobre por qué no se reusa
- * ChatCompletionsHandler).
+ * Entre 2 y 5 llamados a Claude según el camino. Todos con JSON forzado por
+ * schema (output_config.format, Messages API nativa — ver el comentario largo
+ * en anthropic.ts sobre por qué no se reusa ChatCompletionsHandler), y todos
+ * logueados en `agent_llm_calls` para observabilidad de costo (costos.ts,
+ * best-effort: nunca bloquea la respuesta).
  *
  * Principio de diseño: FAIL-CLOSED. Cualquier cosa que salga mal — API caída,
- * JSON raro, catálogo sin cargar, contacto inexistente — termina en "no mandar
- * nada". Nunca en "mandar algo sin verificar".
+ * JSON raro, catálogo sin cargar, contacto inexistente, Calendly caído —
+ * termina en "no mandar nada" (y, en el camino de turnos, "no ejecutar nada").
+ * Nunca en "mandar/agendar algo sin verificar".
  *
  * El envío real NO llama a whatsapp-dispatcher directo: inserta una fila
  * `direction: 'outgoing'` en public.messages y el trigger
@@ -29,7 +38,18 @@ import type {
   MessageInsert,
 } from "../../_shared/supabase.ts";
 import type { AgentRowWithExtra } from "../protocols/base.ts";
-import { callStructured, GuardrailLLMError } from "./anthropic.ts";
+import { crearCalendlyTools } from "../../_shared/calendly.ts";
+import {
+  agregarTurnoFinal,
+  callStructured,
+  GuardrailLLMError,
+  type GuardrailTurn,
+} from "./anthropic.ts";
+
+// Re-exportada para no romper `guardrail-golden-set/index.ts`, que la
+// importaba de acá antes de que se moviera a `anthropic.ts` (evita un
+// import circular con `turnos.ts`, ver el comentario en su definición).
+export { agregarTurnoFinal };
 import {
   cargarCatalogo,
   guardrailListo,
@@ -39,14 +59,30 @@ import {
   type DatosContactoGuardados,
   type SalidaJuez,
   type SalidaRedactor,
+  type SalidaReescritura,
   SCHEMA_JUEZ,
   SCHEMA_REDACTOR,
-  systemJuez,
-  systemRedactor,
+  SCHEMA_REESCRITURA,
+  SUB_ESTADO_INICIAL,
+  type SubEstadoAgendamiento,
+  systemJuezContexto,
+  systemJuezEstatico,
+  systemRedactorBloques,
+  systemRedactorContexto,
+  systemReescrituraContexto,
+  systemReescrituraEstatico,
   type TipoRespuesta,
   userJuez,
   userRedactor,
+  userReescritura,
 } from "./prompts.ts";
+import {
+  ejecutarPasoTurnos,
+  guardarSubEstado,
+  leerSubEstado,
+} from "./turnos.ts";
+import { clasificarEtapa, guardarEtapa, leerEtapa } from "./etapa.ts";
+import { hookCosto } from "./costos.ts";
 
 export interface GuardrailParams {
   client: SupabaseClient;
@@ -61,11 +97,14 @@ export interface GuardrailParams {
   /** Texto del mensaje entrante. Vacío cuando `tipoMensaje` no es "text". */
   mensajePaciente: string;
   /**
-   * Últimos mensajes de la conversación (ambas direcciones), como texto
-   * plano — memoria de corto plazo. Armado en `agent-client/index.ts`. Vacío
-   * si es el primer mensaje de la conversación.
+   * Últimos turnos reales de la conversación (ambas direcciones), armados en
+   * `agent-client/index.ts::getRecentHistoryTurns()`. Vacío si es el primer
+   * mensaje de la conversación. Reemplaza el texto embebido que se usaba
+   * hasta v10 (ver el comentario largo en `guardrail/anthropic.ts`).
    */
-  historialReciente?: string;
+  historialTurnos?: GuardrailTurn[];
+  /** Id del mensaje entrante — clave de idempotencia de `turno_acciones`. */
+  incomingMessageId: string;
   /** Headers de trazabilidad (organization-id, conversation-id, ...). */
   headers?: Record<string, string>;
 }
@@ -76,76 +115,10 @@ export interface GuardrailResult {
   motivo: string;
 }
 
-const VEINTICUATRO_HORAS_MS = 24 * 60 * 60 * 1000;
-
-/**
- * Lee el contador de fuera-de-tema del contacto. Ausente = 0.
- *
- * Expira a las 24hs (pedido de Santi, 2026-08-02: "que no exista el
- * resetear a mano"): si `offtopic_updated_at` es más viejo que eso, se lee
- * como 0 aunque el número guardado sea mayor. `bump_offtopic_count()` (SQL)
- * aplica la misma regla del lado de la ESCRITURA — esto cubre el caso de que
- * pasen 24hs sin que llegue un mensaje nuevo que dispare un bump.
- */
-function leerOfftopicCount(contact?: ContactRow): number {
-  const extra = contact?.extra as Record<string, unknown> | null | undefined;
-  const raw = extra?.offtopic_count;
-
-  const parsed = typeof raw === "number" ? raw : Number(raw);
-  const count = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
-
-  if (count === 0) return 0;
-
-  const updatedAtRaw = extra?.offtopic_updated_at;
-  const updatedAt = typeof updatedAtRaw === "string"
-    ? new Date(updatedAtRaw)
-    : null;
-
-  if (!updatedAt || Number.isNaN(+updatedAt)) {
-    // Sin timestamp (dato viejo, de antes de este cambio): no se puede saber
-    // si venció, se respeta el valor tal cual.
-    return count;
-  }
-
-  return +new Date() - +updatedAt > VEINTICUATRO_HORAS_MS ? 0 : count;
-}
-
-/**
- * Incremento ATÓMICO del contador vía RPC (ver
- * supabase/vampiresa_meli/agent_guardrails.sql).
- *
- * Se hace en una sola sentencia SQL a propósito: si llegan dos mensajes muy
- * seguidos del mismo contacto, dos invocaciones concurrentes de agent-client
- * haciendo read-modify-write por separado dejarían el contador en 1 en vez de
- * 2, y la paciente se ganaría un "pase gratis" extra.
- */
-async function incrementarOfftopic(
-  client: SupabaseClient,
-  contact: ContactRow | undefined,
-): Promise<void> {
-  if (!contact?.id) {
-    log.warn(
-      "No se pudo incrementar offtopic_count: la conversación no tiene contacto asociado",
-    );
-
-    return;
-  }
-
-  const { error } = await client.rpc("bump_offtopic_count", {
-    _contact_id: contact.id,
-  });
-
-  if (error) {
-    // No es fatal: ya decidimos no responder. Pero sí hay que verlo en los logs,
-    // porque significa que la próxima repregunta va a recibir saludo de nuevo.
-    log.error("Falló bump_offtopic_count", error);
-  }
-}
-
 /**
  * Lee los datos de contacto ya guardados (memoria de largo plazo). Mismo
- * campo `contacts.extra` que `offtopic_count`, claves `email` y
- * `nombre_completo`. Ausentes o vacíos = null (no "" — evita mostrarle al
+ * campo `contacts.extra` que `etapa` y `agendamiento_estado`, claves `email`
+ * y `nombre_completo`. Ausentes o vacíos = null (no "" — evita mostrarle al
  * redactor un dato guardado en blanco).
  */
 function leerDatosContacto(contact?: ContactRow): DatosContactoGuardados {
@@ -164,16 +137,16 @@ function leerDatosContacto(contact?: ContactRow): DatosContactoGuardados {
 }
 
 /**
- * Persiste los datos que el redactor detectó en el mensaje (memoria de
- * largo plazo), vía RPC atómico (ver
- * `merge_contact_datos_contacto()` en `agent_guardrails.sql`) — mismo
- * patrón que `incrementarOfftopic()`. No hace nada si el redactor no
+ * Persiste los datos que el redactor (o el paso de turnos) detectó en el
+ * mensaje (memoria de largo plazo), vía RPC atómico (ver
+ * `merge_contact_datos_contacto()` en `agent_guardrails.sql`) — el mismo RPC
+ * que usan `guardarEtapa()` y `guardarSubEstado()`. No hace nada si no se
  * detectó ningún dato nuevo en este mensaje puntual.
  */
 async function guardarDatosContacto(
   client: SupabaseClient,
   contact: ContactRow | undefined,
-  datos: SalidaRedactor["datos_detectados"] | undefined,
+  datos: { email: string | null; nombre_completo: string | null } | undefined,
 ): Promise<void> {
   if (!contact?.id || !datos) return;
 
@@ -183,7 +156,9 @@ async function guardarDatosContacto(
     patch.email = datos.email.trim();
   }
 
-  if (typeof datos.nombre_completo === "string" && datos.nombre_completo.trim()) {
+  if (
+    typeof datos.nombre_completo === "string" && datos.nombre_completo.trim()
+  ) {
     patch.nombre_completo = datos.nombre_completo.trim();
   }
 
@@ -212,7 +187,6 @@ async function registrarNoEnviada(
     tipo: TipoRespuesta;
     mensajeBorrador: string;
     motivo: string;
-    offtopicCount: number;
   },
 ): Promise<void> {
   const { error } = await client
@@ -226,7 +200,9 @@ async function registrarNoEnviada(
       tipo_declarado: datos.tipo,
       mensaje_borrador: datos.mensajeBorrador,
       motivo: datos.motivo,
-      offtopic_count: datos.offtopicCount,
+      // `offtopic_count` queda NULL a propósito desde v16: el contador de
+      // fuera de tema se eliminó (ver prompts.ts). La columna sigue en la
+      // tabla para no perder las filas históricas que sí lo tienen.
     });
 
   if (error) {
@@ -264,6 +240,18 @@ async function enviarMensaje(
 }
 
 /**
+ * Texto plano de un turno de historial, para armar el `textoConversacion`
+ * que usa el gate de seguridad de `turnos.ts` (heurística de "el día/hora
+ * aparece en la conversación"). Los turnos de historial siempre tienen
+ * `content: string` (nunca bloques de tool) — ver `getRecentHistoryTurns`.
+ */
+function historialComoTexto(historial: GuardrailTurn[]): string {
+  return historial
+    .map((t) => (typeof t.content === "string" ? t.content : ""))
+    .join("\n");
+}
+
+/**
  * Corre el pipeline completo. Nunca tira: cualquier error se traduce en
  * "no se envió nada" + log.
  */
@@ -277,18 +265,20 @@ export async function runGuardrail(
     agent,
     tipoMensaje,
     mensajePaciente,
-    historialReciente,
+    historialTurnos,
+    incomingMessageId,
     headers,
   } = params;
 
-  const offtopicCount = leerOfftopicCount(contact);
   const datosGuardados = leerDatosContacto(contact);
+  const etapaGuardada = leerEtapa(contact);
+  const subEstadoGuardado = leerSubEstado(contact);
+  const historial = historialTurnos ?? [];
 
   // ── Portón 0: falta la config que se edita a mano ──
   // Sin lista curada de servicios habilitados (o sin link de Calendly) el
-  // redactor no tiene contra qué matchear y mandaría saludo genérico a todo el
-  // mundo, quemándole el "pase gratis" a cada paciente. Abortamos antes de
-  // gastar un llamado a Claude.
+  // redactor no tiene contra qué matchear y mandaría saludo genérico a todo
+  // el mundo. Abortamos antes de gastar un llamado a Claude.
   if (!guardrailListo()) {
     log.warn(
       "Guardrail activo pero SERVICIOS_HABILITADOS está vacío. No se responde nada. Editar guardrail/catalogo.ts.",
@@ -301,17 +291,6 @@ export async function runGuardrail(
   }
 
   // ── Mensaje no textual: respuesta fija, sin LLM ──
-  // Foto, audio, documento, ubicación, lo que sea. Es una regla por TIPO de
-  // mensaje, no por contenido, así que no necesita redactor ni juez: no hay
-  // nada que redactar (el texto es constante) ni nada que verificar (no puede
-  // contener información inventada sobre tratamientos).
-  //
-  // Va antes de cargar el catálogo y antes del chequeo de API key a propósito:
-  // esta respuesta no depende de ninguno de los dos.
-  //
-  // NO toca el contador de fuera-de-tema: el contador cuenta preguntas que no
-  // sabemos contestar, no formatos que no sabemos leer. Mandar tres fotos no
-  // debería quemarle a nadie el "pase gratis" de su primera pregunta.
   if (tipoMensaje !== "text") {
     log.info(
       `Guardrail — mensaje no textual (${tipoMensaje}): redirección fija a mail`,
@@ -332,10 +311,6 @@ export async function runGuardrail(
   }
 
   // ── Portón 1: precios vigentes desde Supabase ──
-  // Se leen en cada mensaje a propósito: `precios_vigentes` se sincroniza sola
-  // cuando Meli edita el Google Sheets, así un cambio de precio impacta al toque
-  // sin redeploy. Si la query falla, fail-closed: no se responde nada, porque
-  // sin catálogo el bot no tiene fuente de verdad y solo podría improvisar.
   let catalogo: string;
 
   try {
@@ -371,21 +346,69 @@ export async function runGuardrail(
   const model = agent.extra.model;
   const llamado = { apiKey, model, headers, maxTokens: agent.extra.max_tokens };
 
+  // Base del log de costo (`guardrail/costos.ts`). Cada paso agrega su
+  // `step`; los inserts son fire-and-forget y nunca bloquean la respuesta.
+  const costoBase = {
+    client,
+    organizationId: conversation.organization_id,
+    conversationId: conversation.id,
+  };
+
+  // ══════════════ PASO 0 — ETAPA DE LA CONVERSACIÓN ══════════════
+  //
+  // Fail-soft: si el clasificador falla, `clasificarEtapa` devuelve la etapa
+  // guardada y el pipeline sigue igual (ver el comentario en `etapa.ts`).
+
+  const etapa = await clasificarEtapa({
+    apiKey,
+    model,
+    headers,
+    mensajePaciente,
+    historial,
+    etapaGuardada,
+    onLlamado: hookCosto({ ...costoBase, step: "etapa" }),
+  });
+
+  if (etapa !== etapaGuardada) {
+    await guardarEtapa(client, contact, etapa);
+  }
+
+  // El sub-estado del agendamiento solo vive DENTRO del flujo de turnos: si
+  // la conversación no está agendando (o volvió a arrancar de cero tras un
+  // turno ya cerrado), se reinicia al primer escalón. Sin esto, una paciente
+  // que ya agendó una vez arrancaría su próximo turno en
+  // `lista_para_agendar`, con la tool de escritura habilitada de entrada.
+  const subEstado: SubEstadoAgendamiento =
+    etapa === "agendando" || etapa === "agendado"
+      ? subEstadoGuardado
+      : SUB_ESTADO_INICIAL;
+
+  if (subEstado !== subEstadoGuardado) {
+    await guardarSubEstado(client, contact, subEstado);
+  }
+
+  log.info("Guardrail — etapa", { etapa, sub_estado: subEstado });
+
   // ══════════════ PASO 1 — REDACTOR ══════════════
+
+  const turnoActual: GuardrailTurn = {
+    role: "user",
+    content: userRedactor(mensajePaciente),
+  };
+  const messagesRedactor = agregarTurnoFinal(historial, turnoActual);
 
   let redactor: SalidaRedactor;
 
   try {
     redactor = await callStructured<SalidaRedactor>({
       ...llamado,
-      system: systemRedactor(
-        catalogo,
-        offtopicCount,
-        historialReciente ?? "",
-        datosGuardados,
-      ),
-      userMessage: userRedactor(mensajePaciente),
+      system: [
+        ...systemRedactorBloques(catalogo),
+        systemRedactorContexto(datosGuardados, etapa),
+      ],
+      messages: messagesRedactor,
       schema: SCHEMA_REDACTOR,
+      onLlamado: hookCosto({ ...costoBase, step: "redactor" }),
     });
   } catch (error) {
     const detalle = error instanceof GuardrailLLMError
@@ -399,39 +422,172 @@ export async function runGuardrail(
       tipo: "silencio",
       mensajeBorrador: "",
       motivo: `error técnico en el redactor: ${detalle}`,
-      offtopicCount,
     });
 
     return { enviado: false, motivo: "error en el redactor" };
   }
 
-  log.info("Guardrail — redactor", {
-    tipo: redactor.tipo,
-    offtopic_count: offtopicCount,
-  });
+  log.info("Guardrail — redactor", { tipo: redactor.tipo, etapa });
 
   // Memoria de largo plazo: si la paciente escribió su mail o su nombre en
   // este mensaje, guardarlo — independiente de si el juez termina aprobando
-  // la respuesta o no (ver Pieza 2 de proyectos/P05_plan_memoria_agente.md).
+  // la respuesta o no.
   await guardarDatosContacto(client, contact, redactor.datos_detectados);
 
   // ── Camino SILENCIO: no hay juez, no hay nada que aprobar ──
+  //
+  // v16: ya no hay contador, así que este camino se reduce a lo que siempre
+  // debió ser — el mensaje entrante no tiene contenido interpretable. Todo
+  // lo demás, incluido cualquier fuera de tema por enésima vez, se contesta
+  // con `saludo_generico`.
   if (redactor.tipo === "silencio") {
-    await incrementarOfftopic(client, contact);
-
     await registrarNoEnviada(client, conversation, contact, {
       mensajePaciente,
       tipo: "silencio",
       mensajeBorrador: "",
-      motivo: "silencio - contador >= 1",
-      offtopicCount,
+      motivo: "silencio - mensaje sin contenido interpretable",
     });
 
     return {
       enviado: false,
       tipo: "silencio",
-      motivo: "silencio - contador >= 1",
+      motivo: "silencio - mensaje sin contenido interpretable",
     };
+  }
+
+  // ── Camino GESTION_TURNO: paso ejecutor con tools (guardrail/turnos.ts) ──
+  //
+  // El redactor no redacta nada acá (mensaje vacío a propósito, ver
+  // prompts.ts) — este paso consulta Calendly de verdad y, si corresponde,
+  // ejecuta agendar_turno. Su salida reemplaza el mensaje del redactor antes
+  // de pasar al juez, junto con una evidencia que el juez puede verificar.
+  let evidenciaTurnos = "";
+
+  if (redactor.tipo === "gestion_turno") {
+    const calendlyApiKey = Deno.env.get("CALENDLY_API_KEY");
+
+    if (!calendlyApiKey) {
+      log.error(
+        "Guardrail — gestion_turno pero falta el secret CALENDLY_API_KEY. No se responde nada.",
+      );
+
+      await registrarNoEnviada(client, conversation, contact, {
+        mensajePaciente,
+        tipo: "gestion_turno",
+        mensajeBorrador: "",
+        motivo: "falta CALENDLY_API_KEY",
+      });
+
+      return {
+        enviado: false,
+        tipo: "gestion_turno",
+        motivo: "falta CALENDLY_API_KEY",
+      };
+    }
+
+    const telefono = conversation.contact_address;
+
+    if (!telefono) {
+      log.error(
+        "Guardrail — gestion_turno pero la conversación no tiene contact_address. No se responde nada.",
+      );
+
+      await registrarNoEnviada(client, conversation, contact, {
+        mensajePaciente,
+        tipo: "gestion_turno",
+        mensajeBorrador: "",
+        motivo: "conversación sin contact_address",
+      });
+
+      return {
+        enviado: false,
+        tipo: "gestion_turno",
+        motivo: "conversación sin contact_address",
+      };
+    }
+
+    const calendlyTools = crearCalendlyTools(calendlyApiKey);
+
+    let turnosExistentes;
+
+    try {
+      turnosExistentes = (await calendlyTools.consultarTurno(telefono)).turnos;
+    } catch (error) {
+      log.error(
+        "Guardrail — falló consultarTurno. No se responde nada.",
+        error as Error,
+      );
+
+      await registrarNoEnviada(client, conversation, contact, {
+        mensajePaciente,
+        tipo: "gestion_turno",
+        mensajeBorrador: "",
+        motivo: `error consultando Calendly: ${error}`,
+      });
+
+      return {
+        enviado: false,
+        tipo: "gestion_turno",
+        motivo: "error consultando Calendly",
+      };
+    }
+
+    const pasoTurnos = await ejecutarPasoTurnos({
+      llamado,
+      catalogo,
+      mensajePaciente,
+      historial,
+      historialTexto: historialComoTexto(historial),
+      turnosExistentes,
+      subEstado,
+      datosGuardados,
+      onLlamado: hookCosto({ ...costoBase, step: "turnos" }),
+      tools: calendlyTools,
+      client,
+      conversation,
+      contact,
+      incomingMessageId,
+    });
+
+    if (!pasoTurnos.ok) {
+      log.error(
+        "Guardrail — falló el paso de turnos. No se responde nada.",
+        pasoTurnos.motivo,
+      );
+
+      await registrarNoEnviada(client, conversation, contact, {
+        mensajePaciente,
+        tipo: "gestion_turno",
+        mensajeBorrador: "",
+        motivo: pasoTurnos.motivo,
+      });
+
+      return {
+        enviado: false,
+        tipo: "gestion_turno",
+        motivo: pasoTurnos.motivo,
+      };
+    }
+
+    await guardarDatosContacto(client, contact, pasoTurnos.datosDetectados);
+
+    // El sub-estado nuevo ya viene validado por `proximoSubEstado()` (no se
+    // salta escalones, no llega a `lista_para_agendar` sin mail y nombre, y
+    // solo el código puede ponerlo en `agendado`).
+    if (pasoTurnos.subEstadoNuevo !== subEstado) {
+      await guardarSubEstado(client, contact, pasoTurnos.subEstadoNuevo);
+      log.info("Guardrail — sub-estado de agendamiento", {
+        de: subEstado,
+        a: pasoTurnos.subEstadoNuevo,
+      });
+    }
+
+    redactor = {
+      tipo: "gestion_turno",
+      mensaje: pasoTurnos.mensaje,
+      datos_detectados: pasoTurnos.datosDetectados,
+    };
+    evidenciaTurnos = pasoTurnos.evidencia;
   }
 
   // Defensa por las dudas: tipo que sí debería llevar texto, pero vino vacío.
@@ -440,88 +596,176 @@ export async function runGuardrail(
       mensajePaciente,
       tipo: redactor.tipo,
       mensajeBorrador: "",
-      motivo: `el redactor devolvió tipo '${redactor.tipo}' con mensaje vacío`,
-      offtopicCount,
+      motivo:
+        `el paso de redacción devolvió tipo '${redactor.tipo}' con mensaje vacío`,
     });
 
     return { enviado: false, tipo: redactor.tipo, motivo: "borrador vacío" };
   }
 
-  // ══════════════ PASO 2 — JUEZ ══════════════
+  // ══════════════ PASO 2 — JUEZ (+ 1 REESCRITURA) ══════════════
+  //
+  // El juez NO recibe el historial de la conversación (decisión de Santi
+  // 2026-08-06, anotada para revisar por optimización más adelante — ver
+  // proyectos/P05_plan_tools_turnos.md sección 7 punto 9): evalúa solo el
+  // mensaje puntual + la evidencia de turnos, si la hay.
+  //
+  // v16 — LOOP DE REESCRITURA: si el juez rechaza, se hace UN llamado corto
+  // que corrige específicamente el motivo señalado y el juez revisa esa
+  // segunda versión. Si vuelve a rechazar, recién ahí es silencio real
+  // (fail-closed, igual que siempre), logueado con un motivo distinguible
+  // (`rechazado 2 veces`) para poder medir la frecuencia: si aparece seguido,
+  // la señal es que hay que seguir acotando al juez, no agregar otra capa
+  // (ver el plan, sección 2).
 
+  let mensajeFinal = redactor.mensaje;
   let juez: SalidaJuez;
+  let yaSeReescribio = false;
 
-  try {
-    juez = await callStructured<SalidaJuez>({
-      ...llamado,
-      system: systemJuez(catalogo, offtopicCount),
-      userMessage: userJuez(mensajePaciente, redactor.tipo, redactor.mensaje),
-      schema: SCHEMA_JUEZ,
-    });
-  } catch (error) {
-    const detalle = error instanceof GuardrailLLMError
-      ? error.message
-      : String(error);
+  while (true) {
+    try {
+      juez = await callStructured<SalidaJuez>({
+        ...llamado,
+        system: [
+          systemJuezEstatico(catalogo),
+          systemJuezContexto(evidenciaTurnos),
+        ],
+        messages: [
+          {
+            role: "user",
+            content: userJuez(mensajePaciente, redactor.tipo, mensajeFinal),
+          },
+        ],
+        schema: SCHEMA_JUEZ,
+        onLlamado: hookCosto({ ...costoBase, step: "juez" }),
+      });
+    } catch (error) {
+      const detalle = error instanceof GuardrailLLMError
+        ? error.message
+        : String(error);
 
-    log.error("Falló el juez. No se responde nada.", detalle);
+      log.error("Falló el juez. No se responde nada.", detalle);
 
-    await registrarNoEnviada(client, conversation, contact, {
-      mensajePaciente,
-      tipo: redactor.tipo,
-      mensajeBorrador: redactor.mensaje,
-      motivo: `error técnico en el juez: ${detalle}`,
-      offtopicCount,
-    });
+      await registrarNoEnviada(client, conversation, contact, {
+        mensajePaciente,
+        tipo: redactor.tipo,
+        mensajeBorrador: mensajeFinal,
+        motivo: `error técnico en el juez: ${detalle}`,
+      });
 
-    return { enviado: false, tipo: redactor.tipo, motivo: "error en el juez" };
-  }
+      return {
+        enviado: false,
+        tipo: redactor.tipo,
+        motivo: "error en el juez",
+      };
+    }
 
-  log.info("Guardrail — juez", {
-    aprobado: juez.aprobado,
-    motivo: juez.motivo,
-  });
-
-  // ── Rechazado: no se manda nada, se loguea, y nada más ──
-  // (decisión explícita de Santi: no escalar a humano automáticamente)
-  if (!juez.aprobado) {
-    await registrarNoEnviada(client, conversation, contact, {
-      mensajePaciente,
-      tipo: redactor.tipo,
-      mensajeBorrador: redactor.mensaje,
+    log.info("Guardrail — juez", {
+      aprobado: juez.aprobado,
+      reescrito: yaSeReescribio,
       motivo: juez.motivo,
-      offtopicCount,
     });
 
-    return {
-      enviado: false,
-      tipo: redactor.tipo,
-      motivo: `rechazado por el juez: ${juez.motivo}`,
-    };
+    if (juez.aprobado) break;
+
+    // ── Segundo rechazo: silencio real (fail-closed) ──
+    if (yaSeReescribio) {
+      const motivo = `rechazado 2 veces por el juez: ${juez.motivo}`;
+
+      await registrarNoEnviada(client, conversation, contact, {
+        mensajePaciente,
+        tipo: redactor.tipo,
+        mensajeBorrador: mensajeFinal,
+        motivo,
+      });
+
+      return { enviado: false, tipo: redactor.tipo, motivo };
+    }
+
+    // ── Primer rechazo: una sola reescritura acotada ──
+    let reescritura: SalidaReescritura;
+
+    try {
+      reescritura = await callStructured<SalidaReescritura>({
+        ...llamado,
+        system: [
+          systemReescrituraEstatico(catalogo),
+          systemReescrituraContexto(evidenciaTurnos),
+        ],
+        messages: [
+          {
+            role: "user",
+            content: userReescritura(
+              mensajePaciente,
+              mensajeFinal,
+              juez.motivo,
+            ),
+          },
+        ],
+        schema: SCHEMA_REESCRITURA,
+        onLlamado: hookCosto({ ...costoBase, step: "reescritura" }),
+      });
+    } catch (error) {
+      const detalle = error instanceof GuardrailLLMError
+        ? error.message
+        : String(error);
+
+      log.error("Falló la reescritura. No se responde nada.", detalle);
+
+      await registrarNoEnviada(client, conversation, contact, {
+        mensajePaciente,
+        tipo: redactor.tipo,
+        mensajeBorrador: mensajeFinal,
+        motivo:
+          `rechazado por el juez (${juez.motivo}) y falló la reescritura: ${detalle}`,
+      });
+
+      return {
+        enviado: false,
+        tipo: redactor.tipo,
+        motivo: "error en la reescritura",
+      };
+    }
+
+    if (!reescritura.mensaje?.trim()) {
+      await registrarNoEnviada(client, conversation, contact, {
+        mensajePaciente,
+        tipo: redactor.tipo,
+        mensajeBorrador: mensajeFinal,
+        motivo:
+          `rechazado por el juez (${juez.motivo}) y la reescritura vino vacía`,
+      });
+
+      return {
+        enviado: false,
+        tipo: redactor.tipo,
+        motivo: "reescritura vacía",
+      };
+    }
+
+    log.info("Guardrail — reescritura aplicada", { motivo: juez.motivo });
+
+    mensajeFinal = reescritura.mensaje;
+    yaSeReescribio = true;
   }
 
   // ── Aprobado: se manda de verdad ──
+  //
+  // `mensajeFinal` es el borrador original o su reescritura, según qué versión
+  // haya aprobado el juez. Nunca se envía nada que no haya pasado por él.
   try {
-    await enviarMensaje(client, conversation, agent, redactor.mensaje);
+    await enviarMensaje(client, conversation, agent, mensajeFinal);
   } catch (error) {
     log.error("Falló el envío del mensaje aprobado", error as Error);
 
     return { enviado: false, tipo: redactor.tipo, motivo: "error al enviar" };
   }
 
-  // El "pase gratis" recién se cobra cuando el saludo se envió de verdad.
-  //
-  // Solo 'saludo_generico' incrementa. 'catalogo' y 'pedir_precision' NO tocan
-  // el contador a propósito: las dos son consultas legítimas sobre el
-  // consultorio (una puntual, la otra demasiado amplia), no preguntas fuera de
-  // tema. Pedir que aclaren qué tratamiento le interesa no puede costarle a
-  // nadie su única pregunta de cortesía.
-  if (redactor.tipo === "saludo_generico") {
-    await incrementarOfftopic(client, contact);
-  }
-
   return {
     enviado: true,
     tipo: redactor.tipo,
-    motivo: juez.motivo,
+    motivo: yaSeReescribio
+      ? `aprobado tras reescritura: ${juez.motivo}`
+      : juez.motivo,
   };
 }

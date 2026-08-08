@@ -17,6 +17,7 @@ import {
 } from "../_shared/supabase.ts";
 import { ProtocolFactory } from "./protocols/index.ts";
 import { runGuardrail } from "./guardrail/index.ts";
+import type { GuardrailTurn } from "./guardrail/anthropic.ts";
 import { handleRecordatorioButtonReply } from "./recordatorio-buttons.ts";
 import { callTool, initMCP, type MCPServer } from "./tools/mcp.ts";
 import { Toolbox } from "./tools/index.ts";
@@ -134,6 +135,67 @@ const BURST_MAX_GAP_MS = 2 * 60 * 1000;
  * sumar de una foto) pero tampoco cortan la racha (si están dentro de la
  * ventana de tiempo).
  */
+/**
+ * Índice del primer mensaje de la "tanda" que termina en `newestMessage`
+ * (ver `getIncomingBurstText`) — factorizado para que `getRecentHistoryTurns`
+ * corte el historial justo ANTES de la tanda actual, en vez de en
+ * `newestIndex`. Antes de este fix el historial y `mensajePaciente` se
+ * superponían: si la paciente mandaba "hola" + "cuánto sale el botox"
+ * seguidos, "hola" viajaba en el bloque de historial Y dentro de
+ * `mensajePaciente` (encontrado 2026-08-06, ver
+ * `proyectos/P05_plan_tools_turnos.md` sección 2.6 en `consultorio_dermatologico`).
+ */
+function indiceInicioTanda(
+  messages: MessageRow[],
+  newestMessage: MessageRow,
+): number {
+  const newestIndex = messages.findIndex((m) => m.id === newestMessage.id);
+
+  if (newestIndex === -1) return messages.length;
+
+  let ultimoTimestamp = +new Date(messages[newestIndex].created_at);
+  let i = newestIndex;
+
+  for (; i >= 0; i--) {
+    const mensaje = messages[i];
+
+    if (mensaje.direction !== "incoming") break;
+
+    const timestamp = +new Date(mensaje.created_at);
+
+    if (ultimoTimestamp - timestamp > BURST_MAX_GAP_MS) break;
+
+    ultimoTimestamp = timestamp;
+  }
+
+  return i + 1;
+}
+
+/**
+ * Junta el texto de todos los mensajes ENTRANTES consecutivos que terminan en
+ * `newestMessage`, sin ningún mensaje saliente en el medio y sin que pase más
+ * de `BURST_MAX_GAP_MS` entre uno y el siguiente — cubre el caso de alguien
+ * mandando la misma idea en varios mensajes seguidos ("Quiero saber del
+ * botox" + "y cuánto sale"). Solo tiene sentido cuando `messages` ya viene en
+ * orden cronológico ascendente.
+ *
+ * Antes el guardrail solo miraba el texto del último mensaje de la tanda, así
+ * que perdía el contexto de los anteriores (encontrado 2026-08-02 probando en
+ * vivo: "hola" + "que tal" mandados seguidos hacían que el redactor solo viera
+ * "que tal", sin problema porque ambos eran equivalentes, pero con contenido
+ * distinto se hubiera perdido información real).
+ *
+ * El límite de tiempo se agregó el mismo día al encontrar el caso contrario:
+ * si el juez rechaza cada borrador, nunca se inserta un mensaje saliente que
+ * corte la racha, así que sin este tope la función seguía juntando TODOS los
+ * mensajes sin responder de la conversación (en un caso real, más de una hora
+ * y cuatro mensajes de temas distintos en un solo bloque), produciendo un
+ * `mensajePaciente` mezclado que ningún tipo de respuesta podía cubrir bien.
+ *
+ * Mensajes no textuales dentro de la tanda no se concatenan (no hay texto que
+ * sumar de una foto) pero tampoco cortan la racha (si están dentro de la
+ * ventana de tiempo).
+ */
 function getIncomingBurstText(
   messages: MessageRow[],
   newestMessage: MessageRow,
@@ -146,22 +208,14 @@ function getIncomingBurstText(
       : "";
   }
 
+  const inicio = indiceInicioTanda(messages, newestMessage);
   const textos: string[] = [];
-  let ultimoTimestamp = +new Date(messages[newestIndex].created_at);
 
-  for (let i = newestIndex; i >= 0; i--) {
+  for (let i = inicio; i <= newestIndex; i++) {
     const mensaje = messages[i];
 
-    if (mensaje.direction !== "incoming") break;
-
-    const timestamp = +new Date(mensaje.created_at);
-
-    if (ultimoTimestamp - timestamp > BURST_MAX_GAP_MS) break;
-
-    ultimoTimestamp = timestamp;
-
     if (mensaje.content.type === "text" && mensaje.content.text.trim()) {
-      textos.unshift(mensaje.content.text.trim());
+      textos.push(mensaje.content.text.trim());
     }
   }
 
@@ -169,51 +223,79 @@ function getIncomingBurstText(
 }
 
 /**
- * Cuántos mensajes anteriores al mensaje actual se le pasan al redactor como
- * "historial reciente" (memoria de corto plazo, ver
- * `proyectos/P05_plan_memoria_agente.md` en `consultorio_dermatologico`).
- * Decisión de costo de Santi 2026-08-05, no un límite técnico.
+ * Cuántos mensajes anteriores a la tanda actual se le pasan al redactor como
+ * historial de corto plazo (ver `proyectos/P05_plan_tools_turnos.md`,
+ * sección 2.6, en `consultorio_dermatologico`). Decisión de costo de Santi
+ * 2026-08-05, no un límite técnico — no cambia con la migración a turnos
+ * reales de 2026-08-06.
  */
 const HISTORIAL_RECIENTE_MAX_MENSAJES = 10;
 
 /**
- * Texto plano tipo "Paciente: ..." / "Consultorio: ..." de los mensajes que
- * anteceden a `newestMessage`, para darle al redactor contexto de lo que ya
- * se habló sin rearquitecturar el cliente de Claude para mandar un array de
- * turnos reales (ver el comentario largo de `guardrail/anthropic.ts` sobre
- * por qué ese cambio queda para más adelante). Mensajes "internal" no se
- * muestran — son ruido interno de la plataforma, no diálogo con la paciente.
+ * Últimos `maxMessages` mensajes anteriores a la tanda actual, como turnos
+ * reales de la Messages API (`role: "user" | "assistant"`) — reemplaza el
+ * bloque de texto plano embebido en el `system` que se usaba hasta v10 (ver
+ * el comentario largo en `guardrail/anthropic.ts` sobre por qué). Mensajes
+ * "internal" se filtran (ruido de plataforma, no diálogo con la paciente).
+ *
+ * Turnos consecutivos del mismo rol se colapsan en uno solo (la Messages API
+ * exige roles alternados: `user`, `assistant`, `user`, ...) y los turnos
+ * `assistant` iniciales se descartan (el primer turno tiene que ser `user`).
+ * Cada turno de la paciente queda cercado en `<mensaje_paciente>` — mismo
+ * criterio que ya usa `userRedactor` para el mensaje actual, para no bajar la
+ * guardia de prompt injection en los turnos históricos (ver
+ * `prompts.ts::userRedactor`).
  */
-function getRecentHistoryText(
+function getRecentHistoryTurns(
   messages: MessageRow[],
   newestMessage: MessageRow,
   maxMessages: number,
-): string {
+): GuardrailTurn[] {
   const newestIndex = messages.findIndex((m) => m.id === newestMessage.id);
 
-  if (newestIndex <= 0) return "";
+  if (newestIndex <= 0) return [];
 
-  const desde = Math.max(0, newestIndex - maxMessages);
+  const finHistorial = Math.min(
+    indiceInicioTanda(messages, newestMessage),
+    newestIndex,
+  );
+  const desde = Math.max(0, finHistorial - maxMessages);
 
-  return messages
-    .slice(desde, newestIndex)
-    .map((m) => {
-      const quien = m.direction === "incoming"
-        ? "Paciente"
-        : m.direction === "outgoing"
-        ? "Consultorio"
-        : null;
+  const turnos: GuardrailTurn[] = [];
 
-      if (!quien) return null;
+  for (const m of messages.slice(desde, finHistorial)) {
+    const role = m.direction === "incoming"
+      ? "user" as const
+      : m.direction === "outgoing"
+      ? "assistant" as const
+      : null;
 
-      const texto = m.content.type === "text"
-        ? m.content.text.trim()
-        : "[mensaje no textual]";
+    if (!role) continue;
 
-      return texto ? `${quien}: ${texto}` : null;
-    })
-    .filter((linea): linea is string => Boolean(linea))
-    .join("\n");
+    const texto = m.content.type === "text"
+      ? m.content.text.trim()
+      : "[mensaje no textual]";
+
+    if (!texto) continue;
+
+    const contenido = role === "user"
+      ? `<mensaje_paciente>\n${texto}\n</mensaje_paciente>`
+      : texto;
+
+    const ultimo = turnos[turnos.length - 1];
+
+    if (ultimo && ultimo.role === role) {
+      ultimo.content += "\n" + contenido;
+    } else {
+      turnos.push({ role, content: contenido });
+    }
+  }
+
+  while (turnos.length && turnos[0].role !== "user") {
+    turnos.shift();
+  }
+
+  return turnos;
 }
 
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -570,7 +652,7 @@ Deno.serve(async (req) => {
       tipoMensaje = "texto vacío";
     }
 
-    const historialReciente = getRecentHistoryText(
+    const historialTurnos = getRecentHistoryTurns(
       messages,
       newestMessage,
       HISTORIAL_RECIENTE_MAX_MENSAJES,
@@ -583,7 +665,8 @@ Deno.serve(async (req) => {
       agent,
       tipoMensaje,
       mensajePaciente,
-      historialReciente,
+      historialTurnos,
+      incomingMessageId: newestMessage.id,
       headers: {
         "organization-id": organization_id,
         "conversation-id": conv.id,

@@ -209,6 +209,153 @@ comment on function public.merge_contact_datos_contacto(uuid, jsonb) is
 grant execute on function public.merge_contact_datos_contacto(uuid, jsonb) to service_role;
 
 -- ============================================================
+-- 4. Migración 2026-08-06 — tipo "gestion_turno" + log de acciones de turnos
+-- ============================================================
+--
+-- Ver proyectos/P05_plan_tools_turnos.md (repo consultorio_dermatologico)
+-- para el diseño completo. Dos piezas:
+--   4a. Agregar 'gestion_turno' al CHECK de tipo_declarado — si se omite,
+--       registrarNoEnviada() falla en silencio para cualquier mensaje de
+--       turnos que el juez rechace (ver el comentario de PROMPT_VERSION en
+--       prompts.ts sobre por qué el CHECK y el enum de TS tienen que ir
+--       sincronizados).
+--   4b. Tabla turno_acciones — log + IDEMPOTENCIA de acciones reales sobre
+--       Calendly (hoy solo agendar_turno; cancelar_turno no se expone al
+--       modelo, ver sección 2.3 del plan). Es la primera vez que el agente
+--       de IA ejecuta una acción real (no solo redacta texto), así que este
+--       log cumple una función de seguridad, no solo de auditoría:
+--       - El unique index en (incoming_message_id, tool) es lo que evita un
+--         doble agendado si la Edge Function se reinvoca para el mismo
+--         mensaje entrante (ver riesgo #4 del plan). Se inserta la fila
+--         ANTES de llamar a Calendly; si la inserción viola el índice, ya se
+--         intentó, no se ejecuta de nuevo.
+--       - 'bloqueado' es un estado propio (no 'error'): significa que el
+--         gate de código de guardrail/turnos.ts decidió NO ejecutar la
+--         acción (ej. faltaba evidencia de que la paciente confirmó fecha/
+--         hora) — se distingue de 'error' (Calendly falló) para que la
+--         revisión humana sepa si el problema fue nuestro o de la API.
+
+alter table public.agent_respuestas_no_enviadas
+  drop constraint if exists agent_respuestas_no_enviadas_tipo_declarado_check;
+
+alter table public.agent_respuestas_no_enviadas
+  add constraint agent_respuestas_no_enviadas_tipo_declarado_check
+  check (tipo_declarado in ('catalogo', 'pedir_precision', 'faq', 'agendar', 'gestion_turno', 'seguimiento_tratamiento', 'saludo_generico', 'fuera_de_tema', 'silencio'));
+
+create table if not exists public.turno_acciones (
+  id                   bigint generated always as identity primary key,
+  organization_id      uuid not null references public.organizations (id) on delete cascade,
+  conversation_id      text,          -- referencia suelta, sin FK, mismo criterio
+                                      -- que agent_respuestas_no_enviadas.conversation_id
+  contact_address      text,          -- E.164 sin '+'
+  incoming_message_id  text not null,  -- id del mensaje entrante que disparó la acción
+  tool                 text not null check (tool in ('agendar_turno')),
+  args                 jsonb not null,
+  resultado            jsonb,          -- lo que devolvió la tool (o el error)
+  estado               text not null
+    check (estado in ('intentado', 'ok', 'error', 'bloqueado')),
+  created_at           timestamptz not null default now()
+);
+
+-- Idempotencia: como mucho un intento real por (mensaje entrante, tool).
+create unique index if not exists turno_acciones_incoming_message_tool_idx
+  on public.turno_acciones (incoming_message_id, tool);
+
+create index if not exists turno_acciones_org_fecha_idx
+  on public.turno_acciones (organization_id, created_at desc);
+
+comment on table public.turno_acciones is
+  'Log + idempotencia de acciones reales del agente de IA sobre Calendly (agendar_turno). El unique index en (incoming_message_id, tool) evita un doble agendado si la Edge Function se reinvoca para el mismo mensaje. estado=bloqueado = el gate de código decidió no ejecutar; estado=error = Calendly falló; ambos son motivo de revisión humana, no solo estado=ok con juez rechazado.';
+
+-- Mismo criterio de RLS que agent_respuestas_no_enviadas: sin habilitar, solo
+-- escribe la Edge Function con el service role key.
+
+-- ============================================================
+-- 5. Migración 2026-08-08 (v16) — rediseño del guardrail
+-- ============================================================
+--
+-- Ver proyectos/P05_plan_rediseno_guardrail.md (repo consultorio_dermatologico)
+-- y el changelog de PROMPT_VERSION v16 en guardrail/prompts.ts. Tres piezas:
+--   5a. Se RETIRA el contador de fuera de tema.
+--   5b. Tabla nueva agent_llm_calls — observabilidad de costo.
+--   5c. Claves nuevas en contacts.extra (etapa, agendamiento_estado) — no
+--       necesitan DDL, pero se documentan acá.
+
+-- ── 5a. Retiro del contador de fuera de tema ──
+--
+-- El escalón "después de N preguntas fuera de tema, silencio" se elimina por
+-- completo: ahora TODO mensaje fuera de tema recibe siempre la misma
+-- respuesta corta y cordial. Ya nada llama a bump_offtopic_count().
+--
+-- Se DROPEA la función (no se usa más, y dejarla invita a que alguien la
+-- vuelva a llamar sin querer). NO se toca `contacts.extra.offtopic_count` ni
+-- `offtopic_updated_at`: son claves de un jsonb, quedan como dato histórico
+-- inerte y limpiarlas no aporta nada. Tampoco se dropea la columna
+-- `agent_respuestas_no_enviadas.offtopic_count` — desde v16 se escribe NULL,
+-- pero las filas viejas conservan el valor que tenían al momento de decidir.
+--
+-- El CHECK de tipo_declarado se deja TAL CUAL, con 'fuera_de_tema' adentro,
+-- aunque el tipo ya no exista en TypeScript: es un superset a propósito. Si
+-- se sacara, el ALTER fallaría al validar las filas históricas que sí lo
+-- tienen. El test `prompts_test.ts` verifica que TIPOS_RESPUESTA esté
+-- CONTENIDO en el CHECK (no que sean iguales) justamente por esto.
+
+drop function if exists public.bump_offtopic_count(uuid);
+
+-- ── 5b. Observabilidad de costo ──
+--
+-- Un insert por cada llamado real a Claude, en cualquiera de los pasos del
+-- pipeline. Escribe `guardrail/costos.ts`, siempre best-effort: si este
+-- insert falla, la paciente igual recibe su respuesta (es auditoría de
+-- costo, no un gate de seguridad como turno_acciones).
+--
+-- Sin dashboard todavía: primero que el dato exista y se pueda consultar por
+-- SQL directo. Ver las consultas de ejemplo al final del archivo.
+
+create table if not exists public.agent_llm_calls (
+  id                    bigint generated always as identity primary key,
+  organization_id       uuid not null references public.organizations (id) on delete cascade,
+  conversation_id       text,          -- referencia suelta, sin FK, mismo criterio
+                                       -- que agent_respuestas_no_enviadas
+  step                  text not null
+    check (step in ('etapa', 'redactor', 'juez', 'reescritura', 'turnos')),
+  model                 text not null,
+  input_tokens          integer not null default 0,
+  output_tokens         integer not null default 0,
+  cached_tokens         integer not null default 0,  -- cache_read_input_tokens
+  cache_creation_tokens integer not null default 0,  -- cache_creation_input_tokens
+  cost_estimate         numeric(12, 8),              -- USD; null si el modelo no
+                                                     -- está tarifado en costos.ts
+  latency_ms            integer,
+  created_at            timestamptz not null default now()
+);
+
+create index if not exists agent_llm_calls_org_fecha_idx
+  on public.agent_llm_calls (organization_id, created_at desc);
+
+create index if not exists agent_llm_calls_conversation_idx
+  on public.agent_llm_calls (conversation_id, created_at desc);
+
+comment on table public.agent_llm_calls is
+  'Un registro por llamado real a Claude del guardrail (etapa/redactor/juez/reescritura/turnos), con tokens, costo estimado en USD y latencia. Insert best-effort desde guardrail/costos.ts: si falla, la respuesta a la paciente NO se bloquea. cost_estimate se guarda ya calculado a propósito — si cambian los precios, las filas viejas siguen reflejando lo que se pagó, y los tokens crudos permiten recalcular.';
+
+-- Mismo criterio de RLS que las otras tablas de este archivo: sin habilitar,
+-- solo escribe la Edge Function con el service role key.
+
+-- ── 5c. Claves nuevas en contacts.extra (sin DDL) ──
+--
+-- Se suman dos claves al mismo jsonb que ya usan email/nombre_completo, y se
+-- escriben con la MISMA función merge_contact_datos_contacto() — no hizo
+-- falta un RPC nuevo, porque mergea un patch arbitrario sin pisar el resto:
+--   · `etapa`                → 'explorando' | 'quiere_agendar' | 'agendando' |
+--                              'agendado'  (guardrail/etapa.ts)
+--   · `agendamiento_estado`  → 'recolectando_horario' | 'confirmando_datos' |
+--                              'lista_para_agendar' | 'agendado'
+--                              (guardrail/turnos.ts)
+-- `agendamiento_estado` es lo que decide, EN CÓDIGO, si la tool de escritura
+-- `agendar_turno` se le expone o no al modelo en ese mensaje.
+
+-- ============================================================
 -- Consultas útiles para la revisión manual
 -- ============================================================
 --
@@ -229,3 +376,51 @@ grant execute on function public.merge_contact_datos_contacto(uuid, jsonb) to se
 --     from public.contacts c
 --    where (c.extra ->> 'offtopic_count')::integer > 0
 --    order by 2 desc;
+--
+-- Acciones de turnos que necesitan revisión humana (bloqueadas o con error):
+--   select created_at, contact_address, tool, args, resultado, estado
+--     from public.turno_acciones
+--    where estado in ('bloqueado', 'error')
+--    order by created_at desc;
+--
+-- ── v16: costo del agente (agent_llm_calls) ──
+--
+-- Cuánto costó el bot en los últimos 7 días, por paso del pipeline:
+--   select step,
+--          count(*)                as llamados,
+--          sum(input_tokens)       as input,
+--          sum(output_tokens)      as output,
+--          sum(cached_tokens)      as leidos_de_cache,
+--          round(sum(cost_estimate), 4) as usd,
+--          round(avg(latency_ms))  as latencia_ms_promedio
+--     from public.agent_llm_calls
+--    where created_at > now() - interval '7 days'
+--    group by 1
+--    order by usd desc nulls last;
+--
+-- Costo por conversación (para encontrar las que se van de escala):
+--   select conversation_id,
+--          count(*) as llamados,
+--          round(sum(cost_estimate), 4) as usd
+--     from public.agent_llm_calls
+--    where created_at > now() - interval '7 days'
+--    group by 1
+--    order by usd desc nulls last
+--    limit 20;
+--
+-- ¿Está sirviendo el prompt caching? (cached_tokens debería dominar sobre
+-- input_tokens en régimen; si no, algo está invalidando el prefijo):
+--   select step,
+--          sum(cached_tokens) as de_cache,
+--          sum(input_tokens)  as sin_cache
+--     from public.agent_llm_calls
+--    where created_at > now() - interval '1 day'
+--    group by 1;
+--
+-- Frecuencia del "rechazado 2 veces" — la métrica que dice si el juez sigue
+-- demasiado rígido (ver P05_plan_rediseno_guardrail.md, sección 2):
+--   select date_trunc('day', created_at) as dia, count(*)
+--     from public.agent_respuestas_no_enviadas
+--    where motivo like 'rechazado 2 veces%'
+--    group by 1
+--    order by 1 desc;
