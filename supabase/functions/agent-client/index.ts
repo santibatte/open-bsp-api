@@ -552,7 +552,23 @@ Deno.serve(async (req) => {
       .insert(outgoing)
       .throwOnError();
 
-    return new Response("ok", { headers: corsHeaders });
+    // NO cortar acá (bug real encontrado 2026-08-08, ver
+    // PLAN_FIX_BIENVENIDA_CONTEXTO.md): este `if` solo decide si corresponde
+    // mandar el saludo automático, no si hay algo más que contestar. Un
+    // `return` acá significaba que el contenido real del primer mensaje de
+    // la paciente (o del primero después de 24hs de silencio) nunca llegaba
+    // al guardrail — si no volvía a escribir, su pregunta se perdía para
+    // siempre. Se sigue de largo hacia el resto del pipeline con el mismo
+    // mensaje entrante.
+    //
+    // Trade-off aceptado a propósito, no resuelto: si este primer mensaje
+    // real termina clasificado como `saludo_generico` (la paciente solo
+    // escribió "hola", sin pregunta), la paciente recibe el saludo canned
+    // de arriba MÁS la presentación completa que redacta el modelo — el
+    // modelo no sabe que ya se mandó un saludo en este mismo llamado,
+    // porque `messages` (usado más abajo para historial/burst) se cargó
+    // antes de este insert. Doble saludo cosmético, no un silencio — se
+    // prioriza no perder preguntas reales por sobre evitar esta duplicación.
   }
 
   // CHECK IF THERE ARE AI AGENTS

@@ -135,7 +135,58 @@ function leerDatosContacto(contact?: ContactRow): DatosContactoGuardados {
       ? extra.nombre_completo.trim()
       : null;
 
-  return { email, nombreCompleto };
+  const turnoAdicionalAvisado = extra?.turno_adicional_avisado === true;
+
+  return { email, nombreCompleto, turnoAdicionalAvisado };
+}
+
+/**
+ * Persiste que ya se le avisó a la paciente sobre un turno existente antes
+ * de agendar otro (Fix 3, 2026-08-09). Mismo RPC/patrón best-effort que
+ * `guardarDatosContacto`/`guardarSubEstado`.
+ */
+async function guardarTurnoAdicionalAvisado(
+  client: SupabaseClient,
+  contact: ContactRow | undefined,
+): Promise<void> {
+  if (!contact?.id) return;
+
+  const { error } = await client.rpc("merge_contact_datos_contacto", {
+    _contact_id: contact.id,
+    _datos: { turno_adicional_avisado: true },
+  });
+
+  if (error) {
+    log.error(
+      "Falló merge_contact_datos_contacto (turno_adicional_avisado)",
+      error,
+    );
+  }
+}
+
+/**
+ * Resetea el aviso de "turno adicional" junto con el sub-estado, cada vez
+ * que arranca un ciclo de agendamiento nuevo — si no, una paciente que ya
+ * fue avisada una vez en un ciclo viejo no recibiría el aviso en una
+ * situación de turno duplicado distinta más adelante.
+ */
+async function resetearTurnoAdicionalAvisado(
+  client: SupabaseClient,
+  contact: ContactRow | undefined,
+): Promise<void> {
+  if (!contact?.id) return;
+
+  const { error } = await client.rpc("merge_contact_datos_contacto", {
+    _contact_id: contact.id,
+    _datos: { turno_adicional_avisado: false },
+  });
+
+  if (error) {
+    log.error(
+      "Falló merge_contact_datos_contacto (reset turno_adicional_avisado)",
+      error,
+    );
+  }
 }
 
 /**
@@ -387,6 +438,12 @@ export async function runGuardrail(
 
   if (subEstado !== subEstadoGuardado) {
     await guardarSubEstado(client, contact, subEstado);
+
+    if (
+      subEstado === SUB_ESTADO_INICIAL && datosGuardados.turnoAdicionalAvisado
+    ) {
+      await resetearTurnoAdicionalAvisado(client, contact);
+    }
   }
 
   log.info("Guardrail — etapa", { etapa, sub_estado: subEstado });
@@ -528,7 +585,16 @@ export async function runGuardrail(
     let turnosExistentes;
 
     try {
-      turnosExistentes = (await calendlyTools.consultarTurno(telefono)).turnos;
+      // `datosGuardados.email` como fallback (2026-08-09): si no aparece
+      // nada por teléfono y ya conocemos el mail de esta paciente de una
+      // conversación anterior, probar también por mail antes de decir que
+      // no tiene turnos — cubre agendar con un número distinto al que usa
+      // para escribirle al bot. Si el mail es de ESTE mensaje puntual
+      // (recién lo escribió), todavía no está acá — llega recién en el
+      // próximo mensaje, una vez que `guardarDatosContacto` lo persista.
+      turnosExistentes =
+        (await calendlyTools.consultarTurno(telefono, 90, datosGuardados.email))
+          .turnos;
     } catch (error) {
       log.error(
         "Guardrail — falló consultarTurno. No se responde nada.",
@@ -583,6 +649,7 @@ export async function runGuardrail(
       datosGuardados: {
         email: datosEfectivosDeEsteMensaje.email,
         nombreCompleto: datosEfectivosDeEsteMensaje.nombreCompleto,
+        turnoAdicionalAvisado: datosGuardados.turnoAdicionalAvisado,
       },
       onLlamado: hookCosto({ ...costoBase, step: "turnos" }),
       tools: calendlyTools,
@@ -613,6 +680,10 @@ export async function runGuardrail(
     }
 
     await guardarDatosContacto(client, contact, pasoTurnos.datosDetectados);
+
+    if (pasoTurnos.turnoAdicionalAvisado) {
+      await guardarTurnoAdicionalAvisado(client, contact);
+    }
 
     // El sub-estado nuevo ya viene validado por `proximoSubEstado()` (no se
     // salta escalones, no llega a `lista_para_agendar` sin mail y nombre, y

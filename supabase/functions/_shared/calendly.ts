@@ -51,6 +51,11 @@ export interface ConsultaTurnos {
   telefonoBuscado: string;
   cantidad: number;
   turnos: TurnoEncontrado[];
+  /** true si el resultado incluye turnos que solo se encontraron buscando
+   * por mail (no por teléfono) — Fix agregado 2026-08-09, ver
+   * `PLAN_FIX_BIENVENIDA_CONTEXTO.md`. Útil para que el prompt sepa que
+   * encontró algo por una vía secundaria, no la principal. */
+  encontradoPorMail?: boolean;
 }
 
 export interface AgendarArgs {
@@ -154,9 +159,17 @@ export type ResultadoDisponibilidadRango =
   };
 
 export interface CalendlyTools {
+  /**
+   * `emailFallback` (2026-08-09): si la búsqueda por teléfono no encuentra
+   * nada Y se pasa un mail, también busca por mail antes de concluir que no
+   * hay turnos — cubre el caso real de una paciente que agendó con un
+   * número distinto al que usa ahora para escribir. Nunca al revés (nunca
+   * se ignora un match real de teléfono).
+   */
   consultarTurno(
     telefono: string,
     diasAdelante?: number,
+    emailFallback?: string | null,
   ): Promise<ConsultaTurnos>;
   /**
    * Solo lectura — horarios libres de UN día para un tratamiento, sin
@@ -501,6 +514,9 @@ interface ScheduledEventApiRow {
 interface InviteeApiRow {
   uri: string;
   name?: string;
+  /** Campo nativo del invitee de Calendly (siempre lo pide para agendar) —
+   * no confundir con una `questions_and_answers` custom de mail. */
+  email?: string;
   cancel_url?: string;
   reschedule_url?: string;
   questions_and_answers?: { question?: string; answer?: string }[];
@@ -551,23 +567,15 @@ async function listarScheduledEvents(
   return eventos;
 }
 
-async function buscarTurnosPorTelefono(
-  telefono: string,
-  diasAdelante: number,
+/** Recorre `eventos` (ya traídos) y arma los `TurnoEncontrado` cuyos
+ * invitees matchean `coincide`. Factorizado para no pedirle a Calendly la
+ * misma lista de eventos dos veces cuando `consultarTurno` cae al fallback
+ * de mail (ver más abajo). */
+async function buscarTurnosEnEventos(
+  eventos: ScheduledEventApiRow[],
   opts: ClienteOpts,
+  coincide: (inv: InviteeApiRow) => boolean,
 ): Promise<TurnoEncontrado[]> {
-  const telBuscado = normalizarTelefono(telefono);
-
-  if (!telBuscado) {
-    throw new CalendlyError(`Teléfono no válido para buscar: ${telefono}`);
-  }
-
-  const ahora = new Date();
-  const min = ahora.toISOString();
-  const max = new Date(ahora.getTime() + diasAdelante * 86_400_000)
-    .toISOString();
-
-  const eventos = await listarScheduledEvents(min, max, opts);
   const resultado: TurnoEncontrado[] = [];
 
   for (const evento of eventos) {
@@ -578,11 +586,7 @@ async function buscarTurnosPorTelefono(
     );
 
     for (const inv of data.collection) {
-      const telInvitado = normalizarTelefono(
-        extraerTelefonoDeRespuestas(inv.questions_and_answers),
-      );
-
-      if (telInvitado !== telBuscado) continue;
+      if (!coincide(inv)) continue;
 
       const { fecha, hora } = formatearFechaHoraLocal(evento.start_time);
 
@@ -612,11 +616,57 @@ async function consultarTurno(
   telefono: string,
   diasAdelante: number,
   opts: ClienteOpts,
+  emailFallback?: string | null,
 ): Promise<ConsultaTurnos> {
-  const turnos = await buscarTurnosPorTelefono(telefono, diasAdelante, opts);
+  const telBuscado = normalizarTelefono(telefono);
+
+  if (!telBuscado) {
+    throw new CalendlyError(`Teléfono no válido para buscar: ${telefono}`);
+  }
+
+  const ahora = new Date();
+  const min = ahora.toISOString();
+  const max = new Date(ahora.getTime() + diasAdelante * 86_400_000)
+    .toISOString();
+
+  const eventos = await listarScheduledEvents(min, max, opts);
+
+  const turnos = await buscarTurnosEnEventos(
+    eventos,
+    opts,
+    (inv) =>
+      normalizarTelefono(
+        extraerTelefonoDeRespuestas(inv.questions_and_answers),
+      ) ===
+        telBuscado,
+  );
+
+  // Fallback por mail (2026-08-09): la paciente puede haber agendado con un
+  // número distinto al que usa para escribirle al bot (ej. otro celular,
+  // WhatsApp de una tercera persona) — antes de decir "no tenés turnos",
+  // probar también por mail si se conoce uno. Nunca al revés: un match real
+  // de teléfono nunca se descarta ni se mezcla con ruido de mail.
+  const emailNormalizado = emailFallback?.trim().toLowerCase() || null;
+
+  if (turnos.length === 0 && emailNormalizado) {
+    const porMail = await buscarTurnosEnEventos(
+      eventos,
+      opts,
+      (inv) => (inv.email ?? "").trim().toLowerCase() === emailNormalizado,
+    );
+
+    if (porMail.length > 0) {
+      return {
+        telefonoBuscado: telBuscado,
+        cantidad: porMail.length,
+        turnos: porMail,
+        encontradoPorMail: true,
+      };
+    }
+  }
 
   return {
-    telefonoBuscado: normalizarTelefono(telefono) ?? telefono,
+    telefonoBuscado: telBuscado,
     cantidad: turnos.length,
     turnos,
   };
@@ -696,8 +746,19 @@ async function horariosDisponibles(
   opts: ClienteOpts,
   dias = 1,
 ): Promise<{ start_time: string }[]> {
-  const inicio = new Date(`${diaLocalISO}T00:00:00-03:00`);
-  const fin = new Date(inicio.getTime() + dias * 86_400_000);
+  const medianocheLocal = new Date(`${diaLocalISO}T00:00:00-03:00`);
+  const ahora = new Date();
+
+  // Bug real de producción (2026-08-08): si `diaLocalISO` es hoy, la
+  // medianoche local ya quedó en el pasado apenas pasan las 00:00 —
+  // Calendly responde 400 "start_time must be in the future" y, como el
+  // paso de turnos es fail-closed, el paciente se queda sin respuesta
+  // (silencio, no un error visible). Arrancar la ventana en `ahora` cuando
+  // la medianoche ya pasó, nunca antes.
+  const inicio = medianocheLocal.getTime() > ahora.getTime()
+    ? medianocheLocal
+    : ahora;
+  const fin = new Date(medianocheLocal.getTime() + dias * 86_400_000);
 
   const params = new URLSearchParams({
     event_type: eventTypeUri,
@@ -1117,8 +1178,8 @@ export function crearCalendlyTools(
   const clienteOpts: ClienteOpts = { apiKey, ...opts };
 
   return {
-    consultarTurno: (telefono, diasAdelante = 90) =>
-      consultarTurno(telefono, diasAdelante, clienteOpts),
+    consultarTurno: (telefono, diasAdelante = 90, emailFallback = null) =>
+      consultarTurno(telefono, diasAdelante, clienteOpts, emailFallback),
     consultarDisponibilidad: (tratamientoOTipoTurno, fechaDeseada, hoyISO) =>
       consultarDisponibilidad(
         tratamientoOTipoTurno,

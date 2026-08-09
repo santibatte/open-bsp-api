@@ -327,6 +327,13 @@ export type ResultadoPasoTurnos =
     evidencia: string;
     /** Sub-estado ya validado al que hay que mover el flujo (v16). */
     subEstadoNuevo: SubEstadoAgendamiento;
+    /**
+     * true cuando este resultado es el aviso de "ya tenés un turno" (Fix 3)
+     * — le dice a `guardrail/index.ts` que persista
+     * `turno_adicional_avisado` para no volver a preguntar en el próximo
+     * mensaje de este mismo ciclo.
+     */
+    turnoAdicionalAvisado?: boolean;
   }
   | { ok: false; motivo: string };
 
@@ -990,6 +997,41 @@ export async function ejecutarPasoTurnos(
   const ahora = params.ahora ?? new Date();
 
   const turnosRealesTexto = formatearTurnosTexto(turnosExistentes);
+
+  // Fix 3 (2026-08-09, ver PLAN_FIX_BIENVENIDA_CONTEXTO.md, decisión de
+  // Santi): no se bloquea sin preguntar ni se agenda directo — antes de
+  // llegar a agendar_turno con un turno YA existente, se le pregunta a la
+  // paciente si de verdad quiere otro o si con el que ya tiene está bien.
+  // Mensaje armado en código (nunca por el modelo) con el texto real de
+  // Calendly — cero riesgo de inventar fecha/hora. Corta ANTES de llamar a
+  // Claude: no hace falta gastar el llamado si ya sabemos qué hay que
+  // preguntar. Una vez que `turnoAdicionalAvisado` queda en true (ver
+  // `guardrail/index.ts::guardarTurnoAdicionalAvisado`), el mensaje
+  // SIGUIENTE de la paciente ya no vuelve a pasar por acá — se interpreta
+  // que, si siguió en el flujo de agendar, es porque quiere el turno
+  // adicional.
+  if (
+    subEstado === "lista_para_agendar" &&
+    turnosExistentes.length > 0 &&
+    !datosGuardados.turnoAdicionalAvisado
+  ) {
+    log.info(
+      "Paso de turnos — la paciente ya tiene turno(s) agendado(s), preguntando antes de agendar otro",
+      { cantidad: turnosExistentes.length },
+    );
+
+    return {
+      ok: true,
+      mensaje:
+        `Antes de agendarte otro, veo que ya tenés turno agendado:\n\n${turnosRealesTexto}\n\n` +
+        `¿Querés agendar uno adicional además de ese, o con el que ya tenés estás bien?`,
+      datosDetectados: { email: null, nombre_completo: null },
+      evidencia: turnosRealesTexto,
+      subEstadoNuevo: subEstado,
+      turnoAdicionalAvisado: true,
+    };
+  }
+
   const deadline = AbortSignal.timeout(DEADLINE_MS);
 
   const system = [
@@ -1071,6 +1113,35 @@ export async function ejecutarPasoTurnos(
         nombreCompleto: respuesta.data.datos_detectados?.nombre_completo
           ?.trim() || datosGuardados.nombreCompleto,
       };
+
+      // Segunda capa de código contra la alucinación de confirmación (bug
+      // real de producción, 2026-08-08 — el modelo escribió "Te agendo
+      // peeling para el 20 de agosto a las 18:00hs" sin que `agendar_turno`
+      // se hubiera ejecutado ni una vez esta llamada). No alcanza con
+      // pedirle al prompt que no lo haga — ya se le pidió y falló. Si el
+      // propio modelo marca `afirma_turno_confirmado: true` pero
+      // `agendoDeVerdad` es false, el mensaje se descarta acá, nunca llega
+      // al juez ni a la paciente.
+      if (respuesta.data.afirma_turno_confirmado && !agendoDeVerdad) {
+        log.error(
+          "Paso de turnos — el modelo afirmó un turno confirmado sin haber ejecutado agendar_turno. Mensaje descartado, fail-closed.",
+          { mensajeDescartado: respuesta.data.mensaje, subEstado },
+        );
+
+        return {
+          ok: true,
+          mensaje:
+            "Perdón, todavía no pude confirmar tu turno — ¿podés decirme de nuevo qué día y horario te gustaría, así lo reviso bien?",
+          datosDetectados: respuesta.data.datos_detectados,
+          evidencia,
+          // Se queda en el sub-estado ACTUAL (no avanza): si ya estaba en
+          // `confirmando_datos` de verdad (día/hora validados en un turno
+          // anterior), no hay motivo para tirar ese progreso — lo único que
+          // se descarta acá es la afirmación de que el turno ya está
+          // agendado, que es lo que era falso.
+          subEstadoNuevo: subEstado,
+        };
+      }
 
       return {
         ok: true,

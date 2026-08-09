@@ -413,8 +413,31 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                lidadRango` real nunca devolvería eso, porque Calendly
  *                solo tiene slots en los días que la doctora realmente
  *                atiende) — fix: corregir el fixture, no el prompt.
+ * v24 (2026-08-09): tres cambios de contenido, ver PLAN_FIX_BIENVENIDA_CONTEXTO.md
+ *                y P05_lecciones_guardrail.md (Incidente 16) para el detalle
+ *                completo de cada uno:
+ *                (1) nueva regla en "catalogo": nunca explicar/inventar por
+ *                qué un tratamiento solo se agenda ciertos días (nombres de
+ *                jornadas especiales, marcas de equipos alquilados) — venía
+ *                de un caso real donde el bot le dijo a un paciente que IPL
+ *                "se realiza en días de jornada Alma", un detalle logístico
+ *                interno sin sentido para el paciente. Complementado con
+ *                sacarle la marca "Alma"/"Alma Rejuve" al nombre de la
+ *                familia del catálogo (catalogo.ts) para que ni siquiera sea
+ *                contenido literal citable.
+ *                (2) campo nuevo `afirma_turno_confirmado` en el schema del
+ *                agente de turnos (SalidaAgenteTurnos/SCHEMA_AGENTE_TURNOS)
+ *                — segunda capa de código contra la alucinación de
+ *                confirmación (turnos.ts cruza este campo contra si
+ *                `agendar_turno` se ejecutó de verdad; si el modelo dice
+ *                `true` sin ejecución real, el mensaje se descarta).
+ *                (3) el bloque "TURNOS REALES DE ESTA PACIENTE" ahora le
+ *                pide al modelo pedir el mail antes de decir "no tenés
+ *                turnos" si la búsqueda por teléfono dio vacía y no hay mail
+ *                guardado — la búsqueda real ahora también prueba por mail
+ *                (`_shared/calendly.ts::consultarTurno`, fallback nuevo).
  */
-export const PROMPT_VERSION = 23;
+export const PROMPT_VERSION = 24;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -598,6 +621,15 @@ export const SCHEMA_JUEZ: JSONSchema = {
 export interface DatosContactoGuardados {
   email: string | null;
   nombreCompleto: string | null;
+  /**
+   * true si ya se le avisó a la paciente, EN ESTE ciclo de agendamiento, que
+   * tiene otro turno agendado y preguntó si quiere uno adicional (Fix 3,
+   * 2026-08-09 — ver PLAN_FIX_BIENVENIDA_CONTEXTO.md). Se resetea junto con
+   * `agendamiento_estado` cada vez que arranca un ciclo nuevo (ver
+   * `guardrail/index.ts`), para que un turno viejo ya avisado no calle el
+   * aviso de una situación de turno duplicado distinta más adelante.
+   */
+  turnoAdicionalAvisado: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -836,6 +868,13 @@ CÓMO ELEGIR EL "tipo"
    pregunta. Podés reformular para que suene natural y cálida, pero cada dato
    (nombre, precio, qué incluye, duración) tiene que estar literalmente
    respaldado por el catálogo. Cero agregados.
+   Nunca expliques ni inventes POR QUÉ un tratamiento solo se agenda ciertos
+   días (nombres de jornadas especiales, marcas de equipos alquilados,
+   lógica de agenda interna) — eso es logística del consultorio, no
+   información para la paciente, aunque el catálogo o la FAQ mencionen la
+   palabra "jornada" en otro contexto. Si preguntan cuándo hay lugar, la
+   única fuente es la disponibilidad real (tipo "gestion_turno"), nunca una
+   razón que inventes vos acá.
    Si la persona preguntó por VARIOS TRATAMIENTOS DISTINTOS a la vez, o por
    precios en general, este NO es el tipo: va "pedir_precision".
    Si en cambio preguntó por UN tratamiento que en el catálogo tiene varias
@@ -1495,6 +1534,19 @@ export interface SalidaAgenteTurnos {
    * código cuando Calendly confirmó de verdad). `null` = quedarse donde está.
    */
   avanzar_a: SubEstadoAgendamiento | null;
+  /**
+   * Segunda capa de código contra la alucinación de confirmación (bug real
+   * de producción, 2026-08-08 — conversación f2f066e0-3d5a-4f6f-865e-
+   * 47d0cf7cde20: el bot escribió "Te agendo peeling para el 20 de agosto a
+   * las 18:00hs" sin que `agendar_turno` se hubiera ejecutado ni una vez).
+   * `turnos.ts` compara este campo contra `agendoDeVerdad` (si esta llamada
+   * ejecutó `agendar_turno` con éxito de verdad) — si el modelo dice `true`
+   * acá pero no hubo ejecución real, el código descarta el mensaje y manda
+   * uno seguro en su lugar. No confiar en el prompt para esto, es
+   * justamente lo que ya falló: es una señal que el código verifica, no una
+   * instrucción que alcance con pedir bien.
+   */
+  afirma_turno_confirmado: boolean;
 }
 
 export const SCHEMA_AGENTE_TURNOS: JSONSchema = {
@@ -1526,8 +1578,22 @@ export const SCHEMA_AGENTE_TURNOS: JSONSchema = {
         { type: "null" },
       ],
     },
+    afirma_turno_confirmado: {
+      type: "boolean",
+      description:
+        "true SOLO si 'mensaje' le dice a la paciente que su turno YA quedó agendado/confirmado " +
+        "('¡listo, tu turno está confirmado!', 'te agendé para el...', 'nos vemos el...'). " +
+        "false para cualquier otra cosa: pedir datos, ofrecer horarios, preguntar, explicar. " +
+        "El código verifica este campo contra si de verdad se ejecutó agendar_turno en este mismo " +
+        "llamado — si decís true sin que haya pasado, tu mensaje NO se manda.",
+    },
   },
-  required: ["mensaje", "datos_detectados", "avanzar_a"],
+  required: [
+    "mensaje",
+    "datos_detectados",
+    "avanzar_a",
+    "afirma_turno_confirmado",
+  ],
   additionalProperties: false,
 };
 
@@ -1941,6 +2007,13 @@ pasar después de este mensaje, o null para quedarte donde estás. Es una
 sugerencia — el código la valida y puede recortarla. No pongas nunca
 "agendado" vos: eso lo decide el código cuando Calendly confirma de verdad.
 
+También devolvés "afirma_turno_confirmado": true SOLO cuando "mensaje" le
+dice a la paciente que su turno ya quedó agendado (escalón 4 de arriba).
+Si NO acabás de recibir un resultado real de "agendar_turno" en esta misma
+conversación con la tool, tu "mensaje" NO PUEDE decir ni insinuar que el
+turno está confirmado o agendado — todavía no lo sabés. En esos casos,
+"afirma_turno_confirmado" va en false.
+
 ESTILO: cordial, simpática, profesional, "vos" (Argentina), corto (3-4
 líneas), sin jerga médica. Devolvés SIEMPRE un JSON con "mensaje",
 "datos_detectados" (mismo criterio que el redactor: solo lo que la paciente
@@ -1973,9 +2046,15 @@ todavía no corresponde agendar — no la pidas ni digas que agendaste.
 TURNOS REALES DE ESTA PACIENTE
 ════════════════════════════════════════
 Esto es la ÚNICA fuente sobre los turnos de esta paciente — viene directo de
-Calendly, recién consultado. Si está vacío, la paciente NO tiene turnos
-agendados — nunca inventes uno.
+Calendly, recién consultado por teléfono${
+      datosGuardados.email ? " y por mail" : ""
+    }. Si está vacío, la paciente NO tiene turnos agendados — nunca inventes uno.
 ${turnosRealesTexto || "(sin turnos agendados)"}
+${
+      turnosRealesTexto || datosGuardados.email
+        ? ""
+        : `\nSi la paciente pregunta específicamente si tiene algún turno agendado (no si quiere sacar uno nuevo) y esto dio vacío, ANTES de decir que no tiene ninguno pedile su mail — puede haber agendado con un número de teléfono distinto al que usa para escribirte. Recién si tampoco aparece nada por mail, confirmá que no tiene turnos.`
+    }
 
 ════════════════════════════════════════
 DATOS YA GUARDADOS DE ESTE CONTACTO

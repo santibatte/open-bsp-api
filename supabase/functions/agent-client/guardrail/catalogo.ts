@@ -118,7 +118,16 @@ export interface FamiliaTratamiento {
  */
 export const FAMILIAS_TRATAMIENTO: FamiliaTratamiento[] = [
   {
-    nombre: "IPL/NIR de Alma (Alma Rejuve)",
+    // Nombre deliberadamente genérico: "Alma"/"Alma Rejuve" es la marca del
+    // equipo alquilado, un detalle logístico interno (de eso depende qué
+    // días se puede agendar, ver `resolverTipoTurno`) que no le sirve de
+    // nada a la paciente y generaba confusión — el bot llegó a inventar
+    // "se realiza en días de jornada Alma" (2026-08-08, ver
+    // `PLAN_FIX_BIENVENIDA_CONTEXTO.md`). El nombre de la familia es
+    // contenido literal que el redactor puede citar tal cual, así que no
+    // alcanza con instruir "no lo menciones" — hay que sacarle la marca de
+    // acá directamente.
+    nombre: "IPL/NIR (Luz Pulsada Intensa)",
     servicios: ["IPL escote", "IPL facial", "NIR corporal", "NIR facial"],
     descripcion:
       `Tecnología de luz pulsada intensa (IPL) de Alma para mejorar la calidad de la piel: manchas solares, léntigos, pecas, rosácea, enrojecimiento facial, telangiectasias, poros dilatados, fotoenvejecimiento y acné inflamatorio leve a moderado. El NIR (infrarrojo cercano) trata flacidez leve y mejora la firmeza de la piel en rostro, cuello y escote.

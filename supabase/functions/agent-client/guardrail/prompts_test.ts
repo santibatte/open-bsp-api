@@ -72,6 +72,7 @@ const CATALOGO_FALSO = [
 const SIN_DATOS_GUARDADOS: DatosContactoGuardados = {
   email: null,
   nombreCompleto: null,
+  turnoAdicionalAvisado: false,
 };
 
 function promptRedactorCompleto(
@@ -657,14 +658,18 @@ Deno.test("el breakpoint de prompt caching va en el ÚLTIMO bloque estático", (
   );
 });
 
-Deno.test("SCHEMA_AGENTE_TURNOS exige mensaje, datos_detectados y avanzar_a", () => {
+Deno.test("SCHEMA_AGENTE_TURNOS exige mensaje, datos_detectados, avanzar_a y afirma_turno_confirmado", () => {
   // `avanzar_a` (v16) es la PROPUESTA de sub-estado del modelo. Va en
   // `required` porque structured outputs estricto no admite opcionales
   // reales, solo nullable — mismo patrón que `datos_detectados`.
+  // `afirma_turno_confirmado` (Fix 1, 2026-08-09) es la segunda capa de
+  // código contra la alucinación de confirmación: `turnos.ts` la cruza
+  // contra si de verdad se ejecutó `agendar_turno`.
   assertEquals(SCHEMA_AGENTE_TURNOS.required, [
     "mensaje",
     "datos_detectados",
     "avanzar_a",
+    "afirma_turno_confirmado",
   ]);
   assertEquals(SCHEMA_AGENTE_TURNOS.additionalProperties, false);
 });
