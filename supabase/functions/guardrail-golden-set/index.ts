@@ -85,6 +85,7 @@ import { clasificarEtapa } from "../agent-client/guardrail/etapa.ts";
 const SIN_DATOS_GUARDADOS: DatosContactoGuardados = {
   email: null,
   nombreCompleto: null,
+  turnoAdicionalAvisado: false,
 };
 
 // Organización "Vampiresa Meli" — ver project_stack_whatsapp_meta.md.
@@ -251,7 +252,11 @@ const GOLDEN_SET: CasoGoldenSet[] = [
           "<mensaje_paciente>\nSí, es maria.gomez@gmail.com\n</mensaje_paciente>",
       },
     ],
-    datosGuardados: { email: "maria.gomez@gmail.com", nombreCompleto: null },
+    datosGuardados: {
+      email: "maria.gomez@gmail.com",
+      nombreCompleto: null,
+      turnoAdicionalAvisado: false,
+    },
   },
   // ── Casos de gestion_turno (2026-08-06) ──
   {
@@ -325,6 +330,7 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     datosGuardados: {
       email: "maria.gomez@gmail.com",
       nombreCompleto: "María Gómez",
+      turnoAdicionalAvisado: false,
     },
     agendarFixture: {
       agendado: true,
@@ -347,6 +353,7 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     datosGuardados: {
       email: "maria.gomez@gmail.com",
       nombreCompleto: "María Gómez",
+      turnoAdicionalAvisado: false,
     },
     agendarFixture: {
       agendado: true,
@@ -369,6 +376,7 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     datosGuardados: {
       email: "maria.gomez@gmail.com",
       nombreCompleto: "María Gómez",
+      turnoAdicionalAvisado: false,
     },
     agendarFixture: {
       agendado: false,
@@ -389,6 +397,7 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     datosGuardados: {
       email: "maria.gomez@gmail.com",
       nombreCompleto: "María Gómez",
+      turnoAdicionalAvisado: false,
     },
     agendarFixture: {
       agendado: false,
@@ -542,6 +551,7 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     datosGuardados: {
       email: "maria.gomez@gmail.com",
       nombreCompleto: "María Gómez",
+      turnoAdicionalAvisado: false,
     },
   },
   {
@@ -584,6 +594,7 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     datosGuardados: {
       email: "maria.gomez@gmail.com",
       nombreCompleto: "María Gómez",
+      turnoAdicionalAvisado: false,
     },
     agendarFixture: {
       agendado: true,
@@ -1037,6 +1048,7 @@ async function correrCaso(
           datosGuardados.email,
         nombreCompleto: redactor.datos_detectados.nombre_completo?.trim() ||
           datosGuardados.nombreCompleto,
+        turnoAdicionalAvisado: datosGuardados.turnoAdicionalAvisado,
       },
       tools: mockCalendlyTools(caso, llamadaRegistrada),
       client: createUnsecureClient(),
@@ -1174,6 +1186,36 @@ async function correrCaso(
   }
 }
 
+/**
+ * Tope de casos corriendo a la vez contra Anthropic (Incidente 16,
+ * 2026-08-09). Antes se corrían los 36 casos con `Promise.all` sin límite —
+ * cada caso hace hasta 6 llamados reales y secuenciales (etapa, redactor,
+ * hasta 2 en el paso de turnos, juez, reescritura), así que 36 en paralelo
+ * significaba 100-200+ requests simultáneos contra la misma cuenta de
+ * Anthropic. Confirmado que NO era Calendly (`mockCalendlyTools` nunca toca
+ * la API real, ver arriba): los 9 timeouts de esa corrida cayeron todos en
+ * casos de `gestion_turno`, que son justo los que más llamados tienen y los
+ * últimos en la secuencia de cada caso — les tocaba competir contra el
+ * resto del bombardeo por el rate limit. Correr en tandas evita esto sin
+ * volverlo secuencial puro (36x más lento).
+ */
+const CONCURRENCIA_MAX = 6;
+
+async function correrEnTandas<T, R>(
+  items: T[],
+  tamanoTanda: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const resultados: R[] = [];
+
+  for (let i = 0; i < items.length; i += tamanoTanda) {
+    const tanda = items.slice(i, i + tamanoTanda);
+    resultados.push(...await Promise.all(tanda.map(fn)));
+  }
+
+  return resultados;
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
@@ -1202,8 +1244,10 @@ Deno.serve(async (req) => {
       );
     }
 
-    const resultados = await Promise.all(
-      GOLDEN_SET.map((caso) => correrCaso(caso, catalogo, apiKey)),
+    const resultados = await correrEnTandas(
+      GOLDEN_SET,
+      CONCURRENCIA_MAX,
+      (caso) => correrCaso(caso, catalogo, apiKey),
     );
 
     return Response.json({ resultados }, { headers: corsHeaders });
