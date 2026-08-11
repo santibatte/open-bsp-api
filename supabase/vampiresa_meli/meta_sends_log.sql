@@ -34,3 +34,10 @@ create table if not exists public.vampiresa_meta_sends_log (
 
 create index if not exists vampiresa_meta_sends_log_telefono_idx
   on public.vampiresa_meta_sends_log (numero_telefono, fecha desc);
+
+-- RLS: sin policies (nadie necesita leer/escribir vía PostgREST). En
+-- Supabase, `public` sin RLS es legible/editable por cualquiera con la
+-- API key pública del proyecto (grants default de anon/authenticated) —
+-- habilitar RLS sin policies bloquea eso y no afecta al service role
+-- (Edge Function) ni al SQL editor, que bypassean RLS igual.
+alter table public.vampiresa_meta_sends_log enable row level security;

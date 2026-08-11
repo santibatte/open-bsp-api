@@ -55,11 +55,16 @@ create index if not exists agent_respuestas_no_enviadas_contacto_idx
 comment on table public.agent_respuestas_no_enviadas is
   'Respuestas que el agente de IA decidió NO enviar (rechazadas por el juez, o silenciadas por contador de fuera-de-tema). Solo para revisión humana posterior; no dispara nada automático.';
 
--- Nota sobre RLS: se deja SIN habilitar, igual que
--- public.vampiresa_meta_sends_log. Solo escribe la Edge Function con el
--- service role key (que igual bypassea RLS) y solo lee Santi desde el SQL
--- editor. Si en algún momento esta tabla se expone en la UI de open-bsp,
--- HAY que habilitar RLS y agregar una policy por organization_id.
+-- RLS: sin policies (nadie necesita leer/escribir vía PostgREST — solo
+-- escribe la Edge Function con el service role key, y solo lee Santi desde
+-- el SQL editor, ambos bypassean RLS igual). Se había dejado SIN habilitar
+-- pensando que alcanzaba con que "nada más" escribiera/leyera la tabla,
+-- pero en Supabase eso no alcanza: `public` sin RLS es legible/editable por
+-- cualquiera con la API key pública del proyecto (grants default de
+-- anon/authenticated) — Supabase lo marcó como vulnerabilidad crítica
+-- (rls_disabled_in_public) el 2026-08-09. Si en algún momento esta tabla se
+-- expone en la UI de open-bsp, agregar una policy por organization_id.
+alter table public.agent_respuestas_no_enviadas enable row level security;
 
 -- ============================================================
 -- 1b. Migración 2026-08-02 — agregar tipo "faq" al CHECK
@@ -267,8 +272,10 @@ create index if not exists turno_acciones_org_fecha_idx
 comment on table public.turno_acciones is
   'Log + idempotencia de acciones reales del agente de IA sobre Calendly (agendar_turno). El unique index en (incoming_message_id, tool) evita un doble agendado si la Edge Function se reinvoca para el mismo mensaje. estado=bloqueado = el gate de código decidió no ejecutar; estado=error = Calendly falló; ambos son motivo de revisión humana, no solo estado=ok con juez rechazado.';
 
--- Mismo criterio de RLS que agent_respuestas_no_enviadas: sin habilitar, solo
--- escribe la Edge Function con el service role key.
+-- Mismo criterio de RLS que agent_respuestas_no_enviadas: sin policies, pero
+-- SÍ habilitada (ver nota ahí arriba sobre por qué "sin habilitar" era el
+-- error).
+alter table public.turno_acciones enable row level security;
 
 -- ============================================================
 -- 5. Migración 2026-08-08 (v16) — rediseño del guardrail
@@ -339,8 +346,9 @@ create index if not exists agent_llm_calls_conversation_idx
 comment on table public.agent_llm_calls is
   'Un registro por llamado real a Claude del guardrail (etapa/redactor/juez/reescritura/turnos), con tokens, costo estimado en USD y latencia. Insert best-effort desde guardrail/costos.ts: si falla, la respuesta a la paciente NO se bloquea. cost_estimate se guarda ya calculado a propósito — si cambian los precios, las filas viejas siguen reflejando lo que se pagó, y los tokens crudos permiten recalcular.';
 
--- Mismo criterio de RLS que las otras tablas de este archivo: sin habilitar,
--- solo escribe la Edge Function con el service role key.
+-- Mismo criterio de RLS que las otras tablas de este archivo: sin policies,
+-- pero SÍ habilitada.
+alter table public.agent_llm_calls enable row level security;
 
 -- ── 5c. Claves nuevas en contacts.extra (sin DDL) ──
 --
