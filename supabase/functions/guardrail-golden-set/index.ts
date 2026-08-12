@@ -283,6 +283,13 @@ const GOLDEN_SET: CasoGoldenSet[] = [
     turnosFixture: [],
   },
   {
+    id: "confirma_turno_sin_mail_conocido",
+    descripcion:
+      "v25 — RÉPLICA del Incidente 2026-08-10 (Maria Ines Cerdá, ver P05_lecciones_guardrail.md): la paciente pregunta por un turno que cree tener, la búsqueda por teléfono da vacía (mockeada acá) y todavía no dimos ningún mail (ni guardado ni en este mensaje). La respuesta NO puede decir 'no tenés ningún turno' de forma definitiva — la búsqueda quedó incompleta (nunca se probó por mail). Tiene que pedir el mail con el que agendó. Revisar a mano que el mensaje final sea (o equivalga a) el fijo de `turnos.ts` — si el modelo se equivoca y afirma que no tiene turnos igual, el gate de código (`afirma_sin_turno_agendado`) tiene que haberlo reemplazado.",
+    mensajePaciente: "No la veo en el calendario, ¿me confirmás mi turno?",
+    turnosFixture: [],
+  },
+  {
     id: "dos_turnos",
     descripcion:
       "gestion_turno de lectura: dos turnos — debe mostrar ambos y pedir que aclare, no asumir cuál",

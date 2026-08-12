@@ -436,8 +436,43 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                turnos" si la búsqueda por teléfono dio vacía y no hay mail
  *                guardado — la búsqueda real ahora también prueba por mail
  *                (`_shared/calendly.ts::consultarTurno`, fallback nuevo).
+ * v25 (2026-08-12): fix del Incidente 2026-08-10 (Maria Ines Cerdá — el bot
+ *                le dijo "no encontré ningún turno" teniendo uno real
+ *                agendado, ver P05_lecciones_guardrail.md). Causa real: el
+ *                fallback por mail de v24 (punto 3 arriba) buscaba en
+ *                Calendly con el mail YA GUARDADO de antes, nunca con el que
+ *                la paciente acababa de escribir en ese mismo mensaje — para
+ *                cuando el contexto de este prompt se armaba, `datosGuardados
+ *                .email` YA tenía el mail nuevo (por un cálculo posterior en
+ *                `guardrail/index.ts`), así que la instrucción de arriba
+ *                ("pedile el mail antes de decir que no tiene") ni se
+ *                activaba: el prompt creía que ya se había buscado por mail
+ *                cuando en realidad Calendly se consultó solo por teléfono.
+ *                Fix real (código, no prompt): `datosEfectivos()` ahora se
+ *                calcula UNA vez, antes de llamar a Calendly, y ese mismo
+ *                valor es el que ve tanto `consultarTurno` como este prompt
+ *                — nunca más desincronizados. Además, campo nuevo
+ *                `afirma_sin_turno_agendado` en el schema (mismo patrón que
+ *                `afirma_turno_confirmado`): si el modelo afirma que la
+ *                paciente no tiene turnos sin que la búsqueda haya sido
+ *                completa (teléfono Y mail), `turnos.ts` descarta el mensaje
+ *                y lo reemplaza por uno fijo pidiendo el mail — capa de
+ *                código, no depende de que el modelo respete la instrucción.
+ *                Primera corrida del golden set con este campo nuevo: el
+ *                modelo escribió "no encontré ningún turno..." en el caso
+ *                réplica del incidente pero puso `afirma_sin_turno_agendado:
+ *                false` (subdeclarado) — el gate de código no llegó a
+ *                activarse. Wording reforzado (ejemplos textuales de cuándo
+ *                marcar `true`, "ante la duda, poné true", instrucción
+ *                repetida en el bloque de contexto donde el modelo redacta,
+ *                no solo en las reglas generales) — segunda corrida: gate
+ *                activado correctamente en ambos casos relacionados
+ *                (`sin_turnos`, `confirma_turno_sin_mail_conocido`), sin
+ *                falsos positivos en el flujo normal de agendar (
+ *                `agendar_falta_mail`). 36/37 aprobados — el resto ya
+ *                documentado (Incidente 8/14, sin relación con este cambio).
  */
-export const PROMPT_VERSION = 24;
+export const PROMPT_VERSION = 25;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -1547,6 +1582,23 @@ export interface SalidaAgenteTurnos {
    * instrucción que alcance con pedir bien.
    */
   afirma_turno_confirmado: boolean;
+  /**
+   * Tercera capa de código, esta vez contra la afirmación opuesta a
+   * `afirma_turno_confirmado` — bug real de producción, 2026-08-10
+   * (Maria Ines Cerdá, ver P05_lecciones_guardrail.md): el bot le dijo "no
+   * encontré ningún turno agendado" cuando en realidad sí tenía uno, porque
+   * la búsqueda por mail se hizo con un dato viejo (ver fix en
+   * `guardrail/index.ts::datosEfectivos` / `turnos.ts::datosEfectivos`).
+   * `turnos.ts` cruza este campo contra si la búsqueda fue COMPLETA (por
+   * teléfono Y por mail — `turnosExistentes.length === 0 && !datosGuardados
+   * .email` significa que solo se pudo buscar por teléfono): si el modelo
+   * dice `true` acá sin que la búsqueda haya sido completa, el mensaje se
+   * descarta y se reemplaza por uno fijo pidiendo el mail. No alcanza con
+   * pedirle al prompt que no lo haga — el fix de datos ya corrige el caso
+   * reportado, pero esta capa cubre cualquier otra forma en que la
+   * información incompleta llegue al modelo.
+   */
+  afirma_sin_turno_agendado: boolean;
 }
 
 export const SCHEMA_AGENTE_TURNOS: JSONSchema = {
@@ -1587,12 +1639,22 @@ export const SCHEMA_AGENTE_TURNOS: JSONSchema = {
         "El código verifica este campo contra si de verdad se ejecutó agendar_turno en este mismo " +
         "llamado — si decís true sin que haya pasado, tu mensaje NO se manda.",
     },
+    afirma_sin_turno_agendado: {
+      type: "boolean",
+      description:
+        "true SOLO si 'mensaje' le dice a la paciente, de forma definitiva, que NO tiene ningún " +
+        "turno agendado ('no encontré ningún turno a tu nombre', 'no tenés turnos agendados'). " +
+        "false para cualquier otra cosa. El código verifica este campo contra si la búsqueda fue " +
+        "completa (por teléfono Y por mail) — si decís true sin que haya sido completa, tu " +
+        "mensaje NO se manda, se reemplaza por uno pidiendo el mail.",
+    },
   },
   required: [
     "mensaje",
     "datos_detectados",
     "avanzar_a",
     "afirma_turno_confirmado",
+    "afirma_sin_turno_agendado",
   ],
   additionalProperties: false,
 };
@@ -2014,6 +2076,14 @@ conversación con la tool, tu "mensaje" NO PUEDE decir ni insinuar que el
 turno está confirmado o agendado — todavía no lo sabés. En esos casos,
 "afirma_turno_confirmado" va en false.
 
+Y devolvés "afirma_sin_turno_agendado": true CADA VEZ que "mensaje" incluya
+frases como "no encontré ningún turno", "no tenés turnos agendados", "no
+tenés nada agendado" — SIN IMPORTAR si después seguís ofreciendo agendar uno
+nuevo o preguntando algo más. Es la afirmación opuesta a
+"afirma_turno_confirmado", y pesa igual de fuerte: el código la cruza contra
+si la búsqueda fue completa, así que subdeclararla (poner false cuando el
+mensaje sí lo dice) rompe esa protección. Ante la duda, poné true.
+
 ESTILO: cordial, simpática, profesional, "vos" (Argentina), corto (3-4
 líneas), sin jerga médica. Devolvés SIEMPRE un JSON con "mensaje",
 "datos_detectados" (mismo criterio que el redactor: solo lo que la paciente
@@ -2053,7 +2123,7 @@ ${turnosRealesTexto || "(sin turnos agendados)"}
 ${
       turnosRealesTexto || datosGuardados.email
         ? ""
-        : `\nSi la paciente pregunta específicamente si tiene algún turno agendado (no si quiere sacar uno nuevo) y esto dio vacío, ANTES de decir que no tiene ninguno pedile su mail — puede haber agendado con un número de teléfono distinto al que usa para escribirte. Recién si tampoco aparece nada por mail, confirmá que no tiene turnos.`
+        : `\nSi la paciente pregunta específicamente si tiene algún turno agendado (no si quiere sacar uno nuevo) y esto dio vacío, ANTES de decir que no tiene ninguno pedile su mail — puede haber agendado con un número de teléfono distinto al que usa para escribirte. Todavía no se pudo buscar por mail (no hay uno conocido). Si en tu "mensaje" igual terminás escribiendo algo del estilo "no encontré ningún turno" o "no tenés nada agendado" — con o sin ofrecer agendar uno nuevo a continuación — marcá "afirma_sin_turno_agendado": true (el código va a reemplazar ese mensaje por uno pidiendo el mail, es la protección esperada). El único caso con "afirma_sin_turno_agendado": false acá es si tu "mensaje" pide el mail SIN decir en ningún momento que no tiene turnos.`
     }
 
 ════════════════════════════════════════

@@ -21,6 +21,7 @@
  * `resolverTipoTurno` pueda matchear contra él.
  */
 import { normalizarTelefono } from "./telefonos.ts";
+import type { EmailValidado } from "./email.ts";
 
 const CALENDLY_API_BASE = "https://api.calendly.com";
 const TZ = "America/Argentina/Buenos_Aires";
@@ -169,7 +170,7 @@ export interface CalendlyTools {
   consultarTurno(
     telefono: string,
     diasAdelante?: number,
-    emailFallback?: string | null,
+    emailFallback?: EmailValidado | null,
   ): Promise<ConsultaTurnos>;
   /**
    * Solo lectura — horarios libres de UN día para un tratamiento, sin
@@ -616,7 +617,7 @@ async function consultarTurno(
   telefono: string,
   diasAdelante: number,
   opts: ClienteOpts,
-  emailFallback?: string | null,
+  emailFallback?: EmailValidado | null,
 ): Promise<ConsultaTurnos> {
   const telBuscado = normalizarTelefono(telefono);
 
@@ -646,13 +647,14 @@ async function consultarTurno(
   // WhatsApp de una tercera persona) — antes de decir "no tenés turnos",
   // probar también por mail si se conoce uno. Nunca al revés: un match real
   // de teléfono nunca se descarta ni se mezcla con ruido de mail.
-  const emailNormalizado = emailFallback?.trim().toLowerCase() || null;
-
-  if (turnos.length === 0 && emailNormalizado) {
+  // `emailFallback` ya viene validado/normalizado por `parsearEmailOpcional`
+  // (tipo `EmailValidado`) — acá no hace falta volver a limpiarlo, solo
+  // seguir siendo defensivo con lo que Calendly devuelve.
+  if (turnos.length === 0 && emailFallback) {
     const porMail = await buscarTurnosEnEventos(
       eventos,
       opts,
-      (inv) => (inv.email ?? "").trim().toLowerCase() === emailNormalizado,
+      (inv) => (inv.email ?? "").trim().toLowerCase() === emailFallback,
     );
 
     if (porMail.length > 0) {

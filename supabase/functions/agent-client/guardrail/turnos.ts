@@ -37,6 +37,10 @@ import {
   fechaLocalISO,
 } from "../../_shared/calendly.ts";
 import {
+  type EmailValidado,
+  parsearEmailOpcional,
+} from "../../_shared/email.ts";
+import {
   type ExpresionFecha,
   type ExpresionFechaConsulta,
   normalizarTexto,
@@ -102,6 +106,36 @@ export function aplicarOverrideEtapaSobreTipo(
 }
 
 /**
+ * Combina el mail/nombre ya guardados de conversaciones anteriores con los
+ * que el redactor acaba de detectar en ESTE mensaje — el de este mensaje
+ * gana si está presente y es válido. Único punto de esta combinación desde
+ * el Fix del Incidente 2026-08-10 (Maria Ines Cerdá, ver
+ * `P05_lecciones_guardrail.md`): antes vivía duplicada acá (para adelantar
+ * el sub-estado) y en `guardrail/index.ts` (para lo que se le pasa al paso
+ * de turnos), y una tercera vez —la más temprana de las tres, la que de
+ * verdad importaba— directamente NO se hacía: `consultarTurno` se llamaba
+ * con el mail VIEJO (`datosGuardados.email`) antes de que este helper
+ * existiera, así que un mail recién tipeado en el mismo mensaje no servía
+ * para encontrar un turno ya agendado por Calendly.
+ *
+ * El mail pasa siempre por `parsearEmailOpcional` — nunca llega un `""` o
+ * un mail mal formado más allá de este punto (ver `_shared/email.ts`).
+ */
+export function datosEfectivos(
+  datosGuardados: DatosContactoGuardados,
+  datosDetectadosEnEsteMensaje:
+    | { email: string | null; nombre_completo: string | null }
+    | undefined,
+): { email: EmailValidado | null; nombreCompleto: string | null } {
+  return {
+    email: parsearEmailOpcional(datosDetectadosEnEsteMensaje?.email) ??
+      parsearEmailOpcional(datosGuardados.email),
+    nombreCompleto: datosDetectadosEnEsteMensaje?.nombre_completo?.trim() ||
+      datosGuardados.nombreCompleto,
+  };
+}
+
+/**
  * Incidente 13b (2026-08-08): adelanta el sub-estado ANTES de llamar a
  * `ejecutarPasoTurnos`, usando los datos ya conocidos antes de este llamado
  * (guardados + recién detectados en este mensaje por el redactor) — así el
@@ -131,17 +165,10 @@ export function calcularSubEstadoParaLlamado(
 ): SubEstadoAgendamiento {
   if (subEstado !== "confirmando_datos") return subEstado;
 
-  const datosEfectivos = {
-    email: datosDetectadosEnEsteMensaje?.email?.trim() ||
-      datosGuardados.email,
-    nombreCompleto: datosDetectadosEnEsteMensaje?.nombre_completo?.trim() ||
-      datosGuardados.nombreCompleto,
-  };
-
   return proximoSubEstado(
     subEstado,
     "lista_para_agendar",
-    datosEfectivos,
+    datosEfectivos(datosGuardados, datosDetectadosEnEsteMensaje),
     false,
   );
 }
@@ -1139,6 +1166,36 @@ export async function ejecutarPasoTurnos(
           // anterior), no hay motivo para tirar ese progreso — lo único que
           // se descarta acá es la afirmación de que el turno ya está
           // agendado, que es lo que era falso.
+          subEstadoNuevo: subEstado,
+        };
+      }
+
+      // Tercera capa de código (v25, Incidente 2026-08-10 — Maria Ines
+      // Cerdá): la afirmación OPUESTA a la de arriba. Una búsqueda de turnos
+      // se considera completa solo si se pudo intentar por teléfono Y por
+      // mail — `datosGuardados.email` acá ya es el mail EFECTIVO de este
+      // mensaje (ver `datosEfectivos`, mismo valor que vio `consultarTurno`
+      // antes de este llamado, ver `guardrail/index.ts`). Si el modelo dice
+      // que no tiene turnos sin que la búsqueda haya sido completa, se
+      // descarta y se reemplaza por un mensaje fijo pidiendo el mail — no
+      // alcanza con la instrucción del prompt (ver "TURNOS REALES DE ESTA
+      // PACIENTE" en prompts.ts), que ya pedía esto mismo pero dependía de
+      // que el modelo la respetara.
+      const busquedaTurnoIncompleta = turnosExistentes.length === 0 &&
+        !datosGuardados.email;
+
+      if (respuesta.data.afirma_sin_turno_agendado && busquedaTurnoIncompleta) {
+        log.error(
+          "Paso de turnos — el modelo afirmó que la paciente no tiene turnos sin que la búsqueda fuera completa (sin mail). Mensaje descartado, fail-closed.",
+          { mensajeDescartado: respuesta.data.mensaje, subEstado },
+        );
+
+        return {
+          ok: true,
+          mensaje:
+            "No encontré ningún turno con tu número de WhatsApp. ¿Me pasás el mail con el que agendaste, para poder buscarlo?",
+          datosDetectados: respuesta.data.datos_detectados,
+          evidencia,
           subEstadoNuevo: subEstado,
         };
       }

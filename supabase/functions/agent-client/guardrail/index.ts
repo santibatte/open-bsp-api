@@ -79,6 +79,7 @@ import {
 import {
   aplicarOverrideEtapaSobreTipo,
   calcularSubEstadoParaLlamado,
+  datosEfectivos,
   ejecutarPasoTurnos,
   guardarSubEstado,
   leerSubEstado,
@@ -230,8 +231,15 @@ async function guardarDatosContacto(
 /**
  * Registra en `public.agent_respuestas_no_enviadas` todo lo que NO se envió.
  * Es para revisión humana en bloque; no dispara ninguna acción automática.
+ *
+ * Exportada (además de usarse internamente en este archivo) porque
+ * `agent-client/index.ts` también la llama directo para el silencio por
+ * falla de transcripción de audio — ese camino corta ANTES de entrar a
+ * `runGuardrail` (necesita el resultado de Gemini para decidir si hay
+ * mensajePaciente real), así que no puede pasar por el gate normal de acá
+ * abajo.
  */
-async function registrarNoEnviada(
+export async function registrarNoEnviada(
   client: SupabaseClient,
   conversation: ConversationRow,
   contact: ContactRow | undefined,
@@ -582,19 +590,29 @@ export async function runGuardrail(
 
     const calendlyTools = crearCalendlyTools(calendlyApiKey);
 
+    // Mail/nombre efectivos de ESTE mensaje — combina lo ya guardado con lo
+    // que el redactor acaba de detectar, sin esperar a que se persista en
+    // Postgres (ver `datosEfectivos` en turnos.ts). Se calcula ACÁ, antes de
+    // `consultarTurno`, a propósito: Fix del Incidente 2026-08-10 (Maria
+    // Ines Cerdá, ver P05_lecciones_guardrail.md) — antes este bloque vivía
+    // después de la búsqueda en Calendly, así que un mail recién tipeado en
+    // este mismo mensaje llegaba tarde para encontrar un turno ya agendado.
+    const datosEfectivosDeEsteMensaje = datosEfectivos(
+      datosGuardados,
+      redactor.datos_detectados,
+    );
+
     let turnosExistentes;
 
     try {
-      // `datosGuardados.email` como fallback (2026-08-09): si no aparece
-      // nada por teléfono y ya conocemos el mail de esta paciente de una
-      // conversación anterior, probar también por mail antes de decir que
-      // no tiene turnos — cubre agendar con un número distinto al que usa
-      // para escribirle al bot. Si el mail es de ESTE mensaje puntual
-      // (recién lo escribió), todavía no está acá — llega recién en el
-      // próximo mensaje, una vez que `guardarDatosContacto` lo persista.
-      turnosExistentes =
-        (await calendlyTools.consultarTurno(telefono, 90, datosGuardados.email))
-          .turnos;
+      // Fallback por mail (2026-08-09): si no aparece nada por teléfono,
+      // probar también por mail antes de decir que no tiene turnos — cubre
+      // agendar con un número distinto al que usa para escribirle al bot.
+      turnosExistentes = (await calendlyTools.consultarTurno(
+        telefono,
+        90,
+        datosEfectivosDeEsteMensaje.email,
+      )).turnos;
     } catch (error) {
       log.error(
         "Guardrail — falló consultarTurno. No se responde nada.",
@@ -631,12 +649,6 @@ export async function runGuardrail(
         { de: subEstado, a: subEstadoParaLlamado },
       );
     }
-
-    const datosEfectivosDeEsteMensaje = {
-      email: redactor.datos_detectados.email?.trim() || datosGuardados.email,
-      nombreCompleto: redactor.datos_detectados.nombre_completo?.trim() ||
-        datosGuardados.nombreCompleto,
-    };
 
     const pasoTurnos = await ejecutarPasoTurnos({
       llamado,

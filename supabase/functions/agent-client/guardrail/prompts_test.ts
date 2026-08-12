@@ -658,18 +658,22 @@ Deno.test("el breakpoint de prompt caching va en el ÚLTIMO bloque estático", (
   );
 });
 
-Deno.test("SCHEMA_AGENTE_TURNOS exige mensaje, datos_detectados, avanzar_a y afirma_turno_confirmado", () => {
+Deno.test("SCHEMA_AGENTE_TURNOS exige mensaje, datos_detectados, avanzar_a, afirma_turno_confirmado y afirma_sin_turno_agendado", () => {
   // `avanzar_a` (v16) es la PROPUESTA de sub-estado del modelo. Va en
   // `required` porque structured outputs estricto no admite opcionales
   // reales, solo nullable — mismo patrón que `datos_detectados`.
   // `afirma_turno_confirmado` (Fix 1, 2026-08-09) es la segunda capa de
   // código contra la alucinación de confirmación: `turnos.ts` la cruza
   // contra si de verdad se ejecutó `agendar_turno`.
+  // `afirma_sin_turno_agendado` (v25, 2026-08-12) es la tercera capa,
+  // contra la afirmación opuesta: `turnos.ts` la cruza contra si la
+  // búsqueda de turnos fue completa (teléfono Y mail).
   assertEquals(SCHEMA_AGENTE_TURNOS.required, [
     "mensaje",
     "datos_detectados",
     "avanzar_a",
     "afirma_turno_confirmado",
+    "afirma_sin_turno_agendado",
   ]);
   assertEquals(SCHEMA_AGENTE_TURNOS.additionalProperties, false);
 });
