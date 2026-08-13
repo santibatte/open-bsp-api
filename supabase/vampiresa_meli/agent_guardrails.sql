@@ -364,6 +364,153 @@ alter table public.agent_llm_calls enable row level security;
 -- `agendar_turno` se le expone o no al modelo en ese mensaje.
 
 -- ============================================================
+-- 6. Migración 2026-08-13 — candado de procesamiento por conversación
+-- ============================================================
+--
+-- Bug real en producción (ver [[project-calendly-tools-turnos]] en la
+-- memoria de Claude, sección 2026-08-13): dos mensajes entrantes de la misma
+-- paciente, separados por más que el debounce corto
+-- (`response_delay_seconds`, 6s en Velvet) pero por menos que la ventana de
+-- "misma tanda" (`BURST_MAX_GAP_MS`, 2 minutos), disparaban DOS invocaciones
+-- de agent-client en paralelo. Cada una chequeaba "¿hay un mensaje ENTRANTE
+-- más nuevo que el mío?" — pero nunca chequeaba si la OTRA invocación ya
+-- había mandado una respuesta mientras tanto. Resultado real: la misma
+-- pregunta (ej. "necesito tu mail y nombre para confirmar el turno")
+-- contestada dos veces, redactada distinto cada vez por el LLM.
+--
+-- Mismo defecto de fondo que la race condition de doble turno agendado en
+-- Calendly, encontrada en la auditoría de código del 2026-08-08 y nunca
+-- confirmada en producción hasta ahora — este candado cierra las dos cosas
+-- a la vez, en vez de parchear cada síntoma por separado.
+--
+-- Vive en `conversations.extra.processing_claim` (mismo patrón jsonb que
+-- `contacts.extra`), NO en una tabla nueva ni con `pg_advisory_lock`: un
+-- advisory lock real necesita una conexión Postgres persistente por
+-- invocación, y las Edge Functions de Supabase son stateless (cada llamado
+-- es una conexión nueva vía PostgREST/pooler) — no hay garantía de que la
+-- MISMA conexión siga viva para soltar el lock al terminar.
+--
+-- `claim_conversation_processing()` usa `select ... for update` (mismo
+-- truco que `bump_offtopic_count()`) para que el propio chequeo-y-toma del
+-- candado sea atómico entre dos invocaciones que compiten al mismo tiempo.
+-- TTL con fallback (`_ttl_seconds`, 90s desde agent-client — por encima del
+-- deadline real de la pipeline en frío, ~55s, ver golden set 2026-08-09):
+-- un candado más viejo que el TTL se considera abandonado (invocación que
+-- crasheó o el runtime la mató a mitad de camino) y se puede volver a tomar
+-- — evita que una conversación quede trabada para siempre.
+--
+-- `release_conversation_processing()` solo libera si el candado sigue
+-- siendo de la MISMA invocación que lo pide — si ya expiró y otra
+-- invocación lo tomó de nuevo, no lo pisa.
+--
+-- ── Gotcha real encontrado probando esto contra la base real (no en el
+-- código, en el trigger) ──: `conversations` tiene un trigger genérico
+-- `set_extra` (`merge_update('extra')`, ver migración
+-- 20251031114005_generic_merge_update.sql) que en cada UPDATE hace un DEEP
+-- MERGE de `extra` (viejo || nuevo, recursivo) — y un merge nunca borra una
+-- clave que está ausente del lado nuevo. Un `update ... set extra = extra -
+-- 'processing_claim'` corre sin error, pero el trigger BEFORE UPDATE
+-- reconstruye `NEW.extra` mezclando con `OLD.extra`, y como
+-- `processing_claim` sigue estando en `OLD.extra`, vuelve a aparecer —
+-- confirmado con una prueba directa contra `velvet-agent`, la clave nunca
+-- desaparecía. Cualquier código nuevo que intente "borrar" una clave de
+-- `extra`/`content`/`status` en esta base se pisa igual, no es un problema
+-- específico de este candado.
+--
+-- Por eso `release_conversation_processing()` NO borra la clave: la
+-- reemplaza por un `processing_claim` con `claimed_at` en el pasado
+-- (época Unix). `claim_conversation_processing()` ya trata cualquier
+-- `claimed_at` más viejo que `_ttl_seconds` como candado vencido/liberado,
+-- así que el efecto es el mismo sin depender de que el trigger borre nada
+-- — solo reemplaza valores escalares dentro del objeto, que el merge sí
+-- soporta.
+
+create or replace function public.claim_conversation_processing(
+  _conversation_id uuid,
+  _invocation_id text,
+  _ttl_seconds integer default 90
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  _extra      jsonb;
+  _claimed_by text;
+  _claimed_at timestamptz;
+begin
+  select extra,
+         extra -> 'processing_claim' ->> 'invocation_id',
+         (extra -> 'processing_claim' ->> 'claimed_at')::timestamptz
+    into _extra, _claimed_by, _claimed_at
+    from public.conversations
+   where id = _conversation_id
+     for update;
+
+  if not found then
+    return false;
+  end if;
+
+  -- Candado vigente de OTRA invocación → no se puede tomar.
+  if _claimed_by is not null
+     and _claimed_by <> _invocation_id
+     and _claimed_at is not null
+     and _claimed_at > now() - make_interval(secs => _ttl_seconds) then
+    return false;
+  end if;
+
+  update public.conversations
+     set extra = coalesce(_extra, '{}'::jsonb)
+               || jsonb_build_object(
+                    'processing_claim', jsonb_build_object(
+                      'invocation_id', _invocation_id,
+                      'claimed_at', now()
+                    )
+                  )
+   where id = _conversation_id;
+
+  return true;
+end;
+$$;
+
+comment on function public.claim_conversation_processing(uuid, text, integer) is
+  'Candado atómico por conversación (select...for update, mismo truco que bump_offtopic_count) para que dos invocaciones concurrentes de agent-client no procesen y respondan la misma tanda de mensajes en paralelo. Devuelve true si esta invocación tomó el candado, false si otra invocación lo tiene vigente (más nuevo que _ttl_seconds). Usado por agent-client justo antes de llamar al redactor/juez.';
+
+grant execute on function public.claim_conversation_processing(uuid, text, integer) to service_role;
+
+create or replace function public.release_conversation_processing(
+  _conversation_id uuid,
+  _invocation_id text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  -- No se borra la clave `processing_claim` (el trigger set_extra la
+  -- restauraría vía merge, ver comentario arriba) — se la reemplaza por un
+  -- claimed_at vencido, que claim_conversation_processing() ya trata como
+  -- "libre".
+  update public.conversations
+     set extra = extra || jsonb_build_object(
+                    'processing_claim', jsonb_build_object(
+                      'invocation_id', _invocation_id,
+                      'claimed_at', to_jsonb('1970-01-01T00:00:00Z'::text)
+                    )
+                  )
+   where id = _conversation_id
+     and extra -> 'processing_claim' ->> 'invocation_id' = _invocation_id;
+end;
+$$;
+
+comment on function public.release_conversation_processing(uuid, text) is
+  'Libera el candado de claim_conversation_processing() al terminar de procesar (agent-client lo llama en un finally, tanto si contestó bien como si algo falló). No borra la clave processing_claim (el trigger set_extra de conversations la restauraría vía merge) — la reemplaza por un claimed_at vencido (época Unix), que claim_conversation_processing() trata como candado libre. Solo actúa si el candado sigue siendo de esta misma invocación, para no pisar el de una invocación más nueva que lo haya tomado después de que el TTL del propio candado venciera.';
+
+grant execute on function public.release_conversation_processing(uuid, text) to service_role;
+
+-- ============================================================
 -- Consultas útiles para la revisión manual
 -- ============================================================
 --
