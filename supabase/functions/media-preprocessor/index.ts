@@ -271,20 +271,34 @@ Deno.serve(async (req) => {
   // Check AI credits balance before touching storage (only when using our API key)
   const billable = !config.api_key;
 
-  // Fetch cost pricing before the LLM call
-  const { data: costs } = await client
-    .schema("billing")
-    .from("costs")
-    .select("pricing, quantity")
-    .eq("provider", "google")
-    .eq("product", model)
-    .lte("effective_at", new Date().toISOString())
-    .order("effective_at", { ascending: false })
-    .limit(1)
-    .maybeSingle()
-    .throwOnError();
+  // `billing` no está expuesto por PostgREST en este proyecto (fork de un
+  // solo cliente, sin el SaaS multi-tenant original) — PGRST106 "Invalid
+  // schema: billing" si se consulta sin condicionar. Antes esta consulta
+  // corría SIEMPRE, incluso con `billable: false` (que es el caso real acá,
+  // `config.api_key` seteado): tiraba 500 en cada audio/foto/video sin
+  // llegar a llamar a Gemini. Encontrado 2026-08-09 con audios reales que
+  // nunca se transcribieron. Ver `[[project-media-preprocessing-gemini]]`.
+  let costs: { pricing: Record<string, number>; quantity: number } | null =
+    null;
 
   if (billable) {
+    // Fetch cost pricing before the LLM call
+    const { data } = await client
+      .schema("billing")
+      .from("costs")
+      .select("pricing, quantity")
+      .eq("provider", "google")
+      .eq("product", model)
+      .lte("effective_at", new Date().toISOString())
+      .order("effective_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .throwOnError();
+
+    costs = data as
+      | { pricing: Record<string, number>; quantity: number }
+      | null;
+
     if (!costs) {
       return log_update_and_respond(
         "warn",
@@ -438,8 +452,10 @@ Deno.serve(async (req) => {
     );
   }
 
-  // Record AI usage in the ledger
-  if (response.usageMetadata) {
+  // Record AI usage in the ledger — mismo motivo que el gate de arriba: el
+  // schema `billing` no existe para este fork, así que esto solo tiene
+  // sentido (y solo corre) cuando `billable` es true.
+  if (billable && response.usageMetadata) {
     let cost = 0;
 
     if (costs) {

@@ -16,8 +16,9 @@ import {
   type WebhookPayload,
 } from "../_shared/supabase.ts";
 import { ProtocolFactory } from "./protocols/index.ts";
-import { runGuardrail } from "./guardrail/index.ts";
+import { registrarNoEnviada, runGuardrail } from "./guardrail/index.ts";
 import type { GuardrailTurn } from "./guardrail/anthropic.ts";
+import { transcribirAudio } from "./guardrail/transcripcion.ts";
 import { handleRecordatorioButtonReply } from "./recordatorio-buttons.ts";
 import { callTool, initMCP, type MCPServer } from "./tools/mcp.ts";
 import { Toolbox } from "./tools/index.ts";
@@ -666,7 +667,7 @@ Deno.serve(async (req) => {
     // Si el último mensaje es texto, se junta con los textuales anteriores de
     // la misma tanda (ver getIncomingBurstText) para no perder contexto
     // cuando la paciente escribe la idea repartida en varios mensajes.
-    const mensajePaciente = incomingContent.type === "text"
+    let mensajePaciente = incomingContent.type === "text"
       ? getIncomingBurstText(messages, newestMessage)
       : "";
 
@@ -676,6 +677,49 @@ Deno.serve(async (req) => {
 
     if (tipoMensaje === "text" && !mensajePaciente.trim()) {
       tipoMensaje = "texto vacío";
+    }
+
+    // AUDIO — transcripción con Gemini ANTES del guardrail (2026-08-09).
+    //
+    // Solo audio, no foto/video/documento (esos siguen con la redirección
+    // fija a mail más abajo, sin cambios — decisión de Santi, alcance
+    // acotado a audio por ahora). Si Gemini transcribe bien, el mensaje
+    // sigue el pipeline redactor/juez normal como si fuera texto tipeado. Si
+    // falla (config inactiva, sin voz reconocible, error de Gemini, cuota
+    // agotada), no se manda nada — fail-closed, mismo criterio que el resto
+    // del guardrail (decisión de Santi 2026-08-09: silencio, no la
+    // redirección fija, para no mandar un mensaje "de más" por un problema
+    // nuestro de transcripción).
+    if (incomingContent.type === "file" && incomingContent.kind === "audio") {
+      const resultado = await transcribirAudio(client, org, incomingContent);
+
+      if (resultado.ok) {
+        mensajePaciente =
+          `(Este mensaje es una transcripción automática de un audio de WhatsApp — puede tener errores de reconocimiento de voz.)\n${resultado.texto}`;
+        tipoMensaje = "text";
+      } else {
+        log.info(
+          `Guardrail — audio sin transcripción, silencio: ${resultado.motivo}`,
+        );
+
+        await registrarNoEnviada(client, conv, contact, {
+          mensajePaciente: "[audio]",
+          tipo: "silencio",
+          mensajeBorrador: "",
+          motivo: `transcripción de audio falló: ${resultado.motivo}`,
+        });
+
+        return new Response(
+          JSON.stringify({
+            enviado: false,
+            motivo:
+              `silencio por audio sin transcripción (${resultado.motivo})`,
+          }),
+          {
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          },
+        );
+      }
     }
 
     const historialTurnos = getRecentHistoryTurns(
