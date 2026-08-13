@@ -415,6 +415,16 @@ Deno.serve(async (req) => {
     return new Response("ok", { headers: corsHeaders });
   }
 
+  // CHECK IF CONTACT IS BLOCKED
+
+  if (contact?.extra?.blocked) {
+    log.info(
+      `Conversation ${conv.id} corresponds to a blocked contact. Skipping response.`,
+    );
+
+    return new Response("ok", { headers: corsHeaders });
+  }
+
   // CHECK IF CONVERSATION IS PAUSED
 
   if (
