@@ -831,13 +831,11 @@ Deno.serve(async (req) => {
 
       // AUDIO — transcripción con Gemini ANTES del guardrail (2026-08-09).
       //
-      // Solo audio, no foto/video/documento (esos siguen con la redirección
-      // fija a mail más abajo, sin cambios — decisión de Santi, alcance
-      // acotado a audio por ahora). Si Gemini transcribe bien, el mensaje
-      // sigue el pipeline redactor/juez normal como si fuera texto tipeado. Si
-      // falla (config inactiva, sin voz reconocible, error de Gemini, cuota
-      // agotada), no se manda nada — fail-closed, mismo criterio que el resto
-      // del guardrail (decisión de Santi 2026-08-09: silencio, no la
+      // Si Gemini transcribe bien, el mensaje sigue el pipeline
+      // redactor/juez normal como si fuera texto tipeado. Si falla (config
+      // inactiva, sin voz reconocible, error de Gemini, cuota agotada), no
+      // se manda nada — fail-closed, mismo criterio que el resto del
+      // guardrail (decisión de Santi 2026-08-09: silencio, no la
       // redirección fija, para no mandar un mensaje "de más" por un problema
       // nuestro de transcripción).
       if (incomingContent.type === "file" && incomingContent.kind === "audio") {
@@ -864,6 +862,47 @@ Deno.serve(async (req) => {
               enviado: false,
               motivo:
                 `silencio por audio sin transcripción (${resultado.motivo})`,
+            }),
+            {
+              headers: { ...corsHeaders, "Content-Type": "application/json" },
+            },
+          );
+        }
+      }
+
+      // MEDIA SIN AUDIO (foto, video, documento, sticker, etc.) — sin
+      // transcripción ni descripción por ahora (2026-08-14).
+      //
+      // Sin caption no hay nada que contestar — puede ser un comprobante de
+      // pago, una foto de la piel, etc. — silencio, no la redirección fija a
+      // mail (decisión de Santi 2026-08-14, mismo criterio fail-closed que
+      // el audio sin transcripción). Con caption, el texto sigue el
+      // pipeline redactor/juez normal como si fuera un mensaje de texto
+      // tipeado — el guardrail ya sabe redirigir a mail una consulta médica
+      // si corresponde, así que no hace falta aclarar que no se puede ver
+      // la imagen.
+      if (incomingContent.type === "file" && incomingContent.kind !== "audio") {
+        const caption = incomingContent.text?.trim();
+
+        if (caption) {
+          mensajePaciente = caption;
+          tipoMensaje = "text";
+        } else {
+          log.info(
+            `Guardrail — ${incomingContent.kind} sin caption, silencio`,
+          );
+
+          await registrarNoEnviada(client, conv, contact, {
+            mensajePaciente: `[${incomingContent.kind}]`,
+            tipo: "silencio",
+            mensajeBorrador: "",
+            motivo: `${incomingContent.kind} sin texto`,
+          });
+
+          return new Response(
+            JSON.stringify({
+              enviado: false,
+              motivo: `silencio por ${incomingContent.kind} sin texto`,
             }),
             {
               headers: { ...corsHeaders, "Content-Type": "application/json" },
