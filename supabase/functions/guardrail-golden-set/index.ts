@@ -57,6 +57,7 @@ import {
   calcularSubEstadoParaLlamado,
   ejecutarPasoTurnos,
 } from "../agent-client/guardrail/turnos.ts";
+import { hookCosto } from "../agent-client/guardrail/costos.ts";
 import { cargarCatalogo } from "../agent-client/guardrail/catalogo.ts";
 import {
   type DatosContactoGuardados,
@@ -909,6 +910,18 @@ async function correrCaso(
   const etapaGuardada = caso.etapaGuardada ?? "explorando";
   const subEstado = caso.subEstado ?? SUB_ESTADO_INICIAL;
 
+  // Observabilidad de costo (2026-08-14, pedido explícito de Santi tras
+  // notar que el golden set nunca aparecía en `agent_llm_calls` pese a
+  // gastar tokens reales). Mismo hook que producción (`costos.ts`), con
+  // `conversationId` prefijado `golden-set-` para que estas filas se
+  // distingan de tráfico real de pacientes en cualquier reporte de costo.
+  const client = createUnsecureClient();
+  const costoBase = {
+    client,
+    organizationId: ORGANIZATION_ID,
+    conversationId: conversationFicticia(caso.id).id,
+  };
+
   const base: ResultadoCaso = {
     id: caso.id,
     descripcion: caso.descripcion,
@@ -939,6 +952,7 @@ async function correrCaso(
           ),
         }],
         schema: SCHEMA_JUEZ,
+        onLlamado: hookCosto({ ...costoBase, step: "juez" }),
       });
     } catch (error) {
       return {
@@ -968,6 +982,7 @@ async function correrCaso(
     mensajePaciente: caso.mensajePaciente,
     historial: caso.historialTurnos ?? [],
     etapaGuardada,
+    onLlamado: hookCosto({ ...costoBase, step: "etapa" }),
   });
 
   base.etapaCalculada = etapaCalculada;
@@ -992,6 +1007,7 @@ async function correrCaso(
       ],
       messages: messagesRedactor,
       schema: SCHEMA_REDACTOR,
+      onLlamado: hookCosto({ ...costoBase, step: "redactor" }),
     });
   } catch (error) {
     return {
@@ -1057,8 +1073,9 @@ async function correrCaso(
           datosGuardados.nombreCompleto,
         turnoAdicionalAvisado: datosGuardados.turnoAdicionalAvisado,
       },
+      onLlamado: hookCosto({ ...costoBase, step: "turnos" }),
       tools: mockCalendlyTools(caso, llamadaRegistrada),
-      client: createUnsecureClient(),
+      client,
       conversation: conversationFicticia(caso.id),
       incomingMessageId: `golden-set-${caso.id}-${crypto.randomUUID()}`,
       ahora: caso.ahora,
@@ -1124,6 +1141,7 @@ async function correrCaso(
           content: userJuez(caso.mensajePaciente, redactor.tipo, mensajeFinal),
         }],
         schema: SCHEMA_JUEZ,
+        onLlamado: hookCosto({ ...costoBase, step: "juez" }),
       });
     } catch (error) {
       return {
@@ -1167,6 +1185,7 @@ async function correrCaso(
           ),
         }],
         schema: SCHEMA_REESCRITURA,
+        onLlamado: hookCosto({ ...costoBase, step: "reescritura" }),
       });
     } catch (error) {
       return {
