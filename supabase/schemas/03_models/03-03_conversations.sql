@@ -54,6 +54,21 @@ create index conversations_group_address_idx
 on public.conversations
 using btree (group_address);
 
+-- At most one active conversation per contact (and, separately, per group) —
+-- prevents `before_insert_on_messages()` from creating a duplicate conversation
+-- when two inserts for the same contact race each other (e.g. a campaign send
+-- via the Graph API and Meta's webhook echo of that same send arriving at
+-- nearly the same time, before either transaction has committed).
+create unique index conversations_active_contact_uniq
+on public.conversations
+using btree (organization_id, organization_address, service, contact_address)
+where (group_address is null and status = 'active');
+
+create unique index conversations_active_group_uniq
+on public.conversations
+using btree (organization_id, organization_address, service, group_address)
+where (group_address is not null and status = 'active');
+
 create trigger handle_new_conversation
 before insert
 on public.conversations
