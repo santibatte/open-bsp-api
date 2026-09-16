@@ -263,6 +263,13 @@ export type OutgoingMessage =
     version: "1";
     re_message_id?: string; // replied, reacted or forwarded message id
     forwarded?: boolean;
+    // A bulk/campaign send inserted outside the live conversation flow (see
+    // consultorio_dermatologico/scripts/lib/meta_send_log.py). Excluded from
+    // "last activity" ordering, unread counts, the pendientes/24h filters and
+    // the archived/unarchived toggle in the UI (chatSlice.ts,
+    // mostRecentVisibleMessage) so a mass send does not bury or mark as
+    // answered a patient's real unanswered message.
+    broadcast?: boolean;
   }
   & TaskInfo
   & (TextPart | FilePart | ContactsPart | LocationPart | TemplatePart);
