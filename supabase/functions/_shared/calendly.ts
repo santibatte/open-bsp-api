@@ -394,12 +394,16 @@ interface EventTypeActivo {
   nombre: string;
   uri: string;
   duracionMin: number;
+  /** Link público de agendamiento (calendly.com/...), el que se le manda a
+   * la paciente — distinto del `uri` interno de la API. */
+  schedulingUrl: string;
 }
 
 interface EventTypeApiRow {
   name: string;
   uri: string;
   duration: number;
+  scheduling_url: string;
 }
 
 async function listarTiposTurnoActivos(
@@ -422,7 +426,12 @@ async function listarTiposTurnoActivos(
       const n = et.name.toLowerCase();
       return !DOCTORAS_EXCLUIDAS.some((excluida) => n.includes(excluida));
     })
-    .map((et) => ({ nombre: et.name, uri: et.uri, duracionMin: et.duration }));
+    .map((et) => ({
+      nombre: et.name,
+      uri: et.uri,
+      duracionMin: et.duration,
+      schedulingUrl: et.scheduling_url,
+    }));
 }
 
 /** Etiqueta legible — no se usa para matchear, solo para mostrar. */
@@ -498,6 +507,160 @@ async function resolverTipoTurno(
   }
 
   return { ok: true, tipo: candidatos[0] };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Link de agendamiento para jornadas con evento propio (IPL/luz pulsada,
+// bioestimulación, Botox Party) — NO pasa por el modelo. El redactor sigue
+// escribiendo siempre el link genérico fijo (`CALENDLY_LINK`); esto corre
+// como último paso, en código, DESPUÉS de que el juez ya aprobó el mensaje,
+// y reemplaza ese link genérico por el real si corresponde. Así el juez no
+// necesita saber nada de esto (sigue viendo y validando siempre el mismo
+// link fijo de siempre).
+// ─────────────────────────────────────────────────────────────────────────
+
+type CategoriaEventoEspecial = "ipl" | "bioestimulacion" | "botox_party";
+
+const FILTRO_POR_CATEGORIA: Record<CategoriaEventoEspecial, string> = {
+  ipl: "luz pulsada",
+  bioestimulacion: "bioestimul",
+  botox_party: "botox party",
+};
+
+function categoriaEspecialDeTexto(
+  texto: string,
+): CategoriaEventoEspecial | null {
+  const t = texto.toLowerCase();
+
+  if (t.includes("ipl") || t.includes("nir") || t.includes("luz pulsada")) {
+    return "ipl";
+  }
+  if (
+    t.includes("bioestimul") || t.includes("harmonyca") ||
+    t.includes("radiesse") || t.includes("skinvive")
+  ) {
+    return "bioestimulacion";
+  }
+  if (t.includes("botox party")) return "botox_party";
+
+  return null;
+}
+
+const MESES_ES: Record<string, number> = {
+  enero: 1,
+  febrero: 2,
+  marzo: 3,
+  abril: 4,
+  mayo: 5,
+  junio: 6,
+  julio: 7,
+  agosto: 8,
+  septiembre: 9,
+  setiembre: 9,
+  octubre: 10,
+  noviembre: 11,
+  diciembre: 12,
+};
+
+/** Mes (1-12) mencionado en el nombre del event type — ej. "Luz Pulsada
+ * Intensa OCTUBRE" → 10. `null` si el nombre no menciona ningún mes. */
+function mesDeNombreEvento(nombre: string): number | null {
+  const n = nombre.toLowerCase();
+
+  for (const [mes, indice] of Object.entries(MESES_ES)) {
+    if (n.includes(mes)) return indice;
+  }
+
+  return null;
+}
+
+/**
+ * Cuando Meli deja varios meses cargados a la vez (ej. sep/oct/nov/dic de
+ * IPL activos simultáneamente — caso real encontrado 2026-09-16), elige el
+ * que menos falta contando desde el mes actual hacia adelante (0 = este
+ * mismo mes). Nunca elige "hacia atrás": un event type de un mes ya pasado
+ * que alguien se olvidó de desactivar queda último, no primero.
+ * Devuelve `null` (deferir a "ambiguo") si algún candidato no menciona mes
+ * reconocible, o si hay un empate — nunca adivina en esos casos.
+ */
+function elegirMasProximo(
+  candidatos: EventTypeActivo[],
+  mesActualIndex: number,
+): EventTypeActivo | null {
+  const conMes = candidatos.map((c) => ({
+    candidato: c,
+    mes: mesDeNombreEvento(c.nombre),
+  }));
+
+  if (conMes.some((x) => x.mes === null)) return null;
+
+  const conDistancia = conMes.map((x) => ({
+    candidato: x.candidato,
+    distancia: ((x.mes! - mesActualIndex) % 12 + 12) % 12,
+  }));
+
+  const minDistancia = Math.min(...conDistancia.map((x) => x.distancia));
+  const ganadores = conDistancia.filter((x) => x.distancia === minDistancia);
+
+  return ganadores.length === 1 ? ganadores[0].candidato : null;
+}
+
+export type ResultadoLinkAgendamiento =
+  | { tipo: "generico" }
+  | { tipo: "resuelto"; nombre: string; link: string }
+  | { tipo: "ambiguo"; opciones: { nombre: string; link: string }[] }
+  | { tipo: "sin_evento_activo" };
+
+/**
+ * Resuelve, en vivo contra Calendly, si el texto de la consulta corresponde
+ * a una jornada especial con link propio. Si no matchea ninguna categoría
+ * especial devuelve "generico" SIN llamar a la API — el link fijo de
+ * siempre sigue sirviendo para la consulta común.
+ */
+export async function resolverLinkAgendamiento(
+  apiKey: string,
+  textoConsulta: string,
+  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<ResultadoLinkAgendamiento> {
+  const categoria = categoriaEspecialDeTexto(textoConsulta);
+
+  if (!categoria) return { tipo: "generico" };
+
+  const clienteOpts: ClienteOpts = { apiKey, ...opts };
+  const activos = await listarTiposTurnoActivos(clienteOpts);
+  const filtro = FILTRO_POR_CATEGORIA[categoria];
+  const candidatos = activos.filter((e) =>
+    e.nombre.toLowerCase().includes(filtro)
+  );
+
+  if (candidatos.length === 0) return { tipo: "sin_evento_activo" };
+
+  if (candidatos.length > 1) {
+    const mesActualIndex = Number(fechaLocalISO(new Date()).split("-")[1]);
+    const elegido = elegirMasProximo(candidatos, mesActualIndex);
+
+    if (elegido) {
+      return {
+        tipo: "resuelto",
+        nombre: elegido.nombre,
+        link: elegido.schedulingUrl,
+      };
+    }
+
+    return {
+      tipo: "ambiguo",
+      opciones: candidatos.map((c) => ({
+        nombre: c.nombre,
+        link: c.schedulingUrl,
+      })),
+    };
+  }
+
+  return {
+    tipo: "resuelto",
+    nombre: candidatos[0].nombre,
+    link: candidatos[0].schedulingUrl,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────

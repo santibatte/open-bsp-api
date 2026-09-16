@@ -38,7 +38,11 @@ import type {
   MessageInsert,
 } from "../../_shared/supabase.ts";
 import type { AgentRowWithExtra } from "../protocols/base.ts";
-import { crearCalendlyTools } from "../../_shared/calendly.ts";
+import {
+  crearCalendlyTools,
+  resolverLinkAgendamiento,
+  type ResultadoLinkAgendamiento,
+} from "../../_shared/calendly.ts";
 import {
   agregarTurnoFinal,
   callStructured,
@@ -51,8 +55,10 @@ import {
 // import circular con `turnos.ts`, ver el comentario en su definición).
 export { agregarTurnoFinal };
 import {
+  CALENDLY_LINK,
   cargarCatalogo,
   guardrailListo,
+  MAIL_CONSULTAS,
   MENSAJE_NO_TEXTUAL,
 } from "./catalogo.ts";
 import {
@@ -298,6 +304,34 @@ async function enviarMensaje(
   };
 
   await client.from("messages").insert(outgoing).throwOnError();
+}
+
+/**
+ * Reemplaza, en un mensaje YA aprobado por el juez, el link genérico de
+ * agendamiento por el real de la jornada especial que corresponda — ver el
+ * comentario en el call site (justo antes de `enviarMensaje`) para el
+ * porqué de que esto corra después del juez y no antes.
+ */
+function aplicarResolucionLink(
+  mensaje: string,
+  resolucion: ResultadoLinkAgendamiento,
+): string {
+  switch (resolucion.tipo) {
+    case "generico":
+      return mensaje;
+    case "resuelto":
+      return mensaje.replaceAll(CALENDLY_LINK, resolucion.link);
+    case "ambiguo":
+      return mensaje.replaceAll(
+        CALENDLY_LINK,
+        resolucion.opciones.map((o) => `${o.nombre}: ${o.link}`).join(" — "),
+      );
+    case "sin_evento_activo":
+      return mensaje.replaceAll(
+        CALENDLY_LINK,
+        `que por el momento no tiene fecha agendable online — escribinos a ${MAIL_CONSULTAS} y te confirmamos la próxima`,
+      );
+  }
 }
 
 /**
@@ -879,6 +913,34 @@ export async function runGuardrail(
   //
   // `mensajeFinal` es el borrador original o su reescritura, según qué versión
   // haya aprobado el juez. Nunca se envía nada que no haya pasado por él.
+  //
+  // Antes de enviar: si el mensaje aprobado incluye el link genérico Y la
+  // consulta es sobre una jornada con evento propio (IPL/luz pulsada,
+  // bioestimulación, Botox Party — esos cambian de link por campaña, ver
+  // `resolverLinkAgendamiento` en `_shared/calendly.ts`), lo reemplazamos acá
+  // por el real. A propósito DESPUÉS del juez: el juez nunca se entera de
+  // esto, siempre valida el link fijo de siempre — ver Incidente reportado
+  // por Santi 2026-09-16 (bot mandaba el link genérico para luz pulsada).
+  if (mensajeFinal.includes(CALENDLY_LINK)) {
+    const calendlyApiKeyLink = Deno.env.get("CALENDLY_API_KEY");
+
+    if (calendlyApiKeyLink) {
+      try {
+        const resolucionLink = await resolverLinkAgendamiento(
+          calendlyApiKeyLink,
+          `${mensajePaciente} ${mensajeFinal}`,
+        );
+
+        mensajeFinal = aplicarResolucionLink(mensajeFinal, resolucionLink);
+      } catch (error) {
+        log.error(
+          "No se pudo resolver el link de agendamiento especial — se manda el link genérico",
+          error as Error,
+        );
+      }
+    }
+  }
+
   try {
     await enviarMensaje(client, conversation, agent, mensajeFinal);
   } catch (error) {
