@@ -49,6 +49,7 @@ import {
   GuardrailLLMError,
   type GuardrailTurn,
 } from "./anthropic.ts";
+import { findCtwaClid } from "../../_shared/referral.ts";
 
 // Re-exportada para no romper `guardrail-golden-set/index.ts`, que la
 // importaba de acá antes de que se moviera a `anthropic.ts` (evita un
@@ -438,7 +439,30 @@ export async function runGuardrail(
     return { enviado: false, motivo: "falta ANTHROPIC_API_KEY" };
   }
 
-  const model = agent.extra.model;
+  // Lead nuevo por ads: si el mensaje que abrió ESTA conversación de WhatsApp
+  // trae el `ctwa_clid` de un anuncio Click-to-WhatsApp, esa conversación
+  // puntual la atiende Sonnet en vez del Haiku default — mismo prompt, más
+  // capacidad. Se recalcula por conversación (no queda un flag permanente en
+  // el contacto): si la persona vuelve meses después sin pasar de nuevo por
+  // el anuncio, esa conversación nueva vuelve a Haiku. NO cubre leads que
+  // llegan por Instagram: ahí Meta manda un `referral` con forma distinta
+  // (sin `ctwa_clid` — ver InstagramReferral), todavía sin manejar acá.
+  const esReferralDeAds = conversation.contact_address
+    ? !!(await findCtwaClid(
+      client,
+      conversation.organization_id,
+      conversation.contact_address,
+    ))
+    : false;
+
+  const model = esReferralDeAds ? "claude-sonnet-4-6" : agent.extra.model;
+
+  if (esReferralDeAds) {
+    log.info("Guardrail — referral de Meta detectado, usando Sonnet", {
+      conversation_id: conversation.id,
+    });
+  }
+
   const llamado = { apiKey, model, headers, maxTokens: agent.extra.max_tokens };
 
   // Base del log de costo (`guardrail/costos.ts`). Cada paso agrega su

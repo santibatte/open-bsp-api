@@ -39,6 +39,7 @@
 // Dataset ID + system user token from Events Manager).
 import * as log from "../_shared/logger.ts";
 import { createUnsecureClient, type Json } from "../_shared/supabase.ts";
+import { findCtwaClid } from "../_shared/referral.ts";
 
 const META_API_VERSION = "v24.0"; // matches whatsapp-dispatcher's pinned version
 const DATASET_ID = Deno.env.get("META_CAPI_DATASET_ID") ?? "";
@@ -61,37 +62,6 @@ async function sha256Hex(input: string): Promise<string> {
   return Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-}
-
-/** First inbound message on this contact's conversation that carries a
- * Click-to-WhatsApp referral — Meta only attaches `ctwa_clid` to the message
- * that opened the conversation, not to every message after it. */
-async function findCtwaClid(
-  client: ReturnType<typeof createUnsecureClient>,
-  organizationId: string,
-  contactAddress: string,
-): Promise<string | null> {
-  const { data, error } = await client
-    .from("messages")
-    .select("content")
-    .eq("organization_id", organizationId)
-    .eq("contact_address", contactAddress)
-    .eq("service", "whatsapp")
-    .eq("direction", "incoming")
-    .order("timestamp", { ascending: true })
-    .limit(20); // referral, if present, is on one of the first few messages
-
-  if (error) {
-    log.error("Failed to look up messages for ctwa_clid", { error });
-    throw error;
-  }
-
-  for (const row of data ?? []) {
-    const content = row.content as { referral?: { ctwa_clid?: string } };
-    if (content?.referral?.ctwa_clid) return content.referral.ctwa_clid;
-  }
-
-  return null;
 }
 
 Deno.serve(async (req) => {
