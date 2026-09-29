@@ -345,8 +345,15 @@ function getRecentHistoryTurns(
 
     if (!texto) continue;
 
+    // Las campañas (`meta_send_log.py`) se marcan para que el modelo sepa
+    // que la paciente puede estar respondiendo a eso, no a una charla previa.
+    const esCampana = m.direction === "outgoing" &&
+      !!(m.content as { broadcast?: boolean }).broadcast;
+
     const contenido = role === "user"
       ? `<mensaje_paciente>\n${texto}\n</mensaje_paciente>`
+      : esCampana
+      ? `[Mensaje de campaña que el consultorio le envió a la paciente]\n${texto}`
       : texto;
 
     const ultimo = turnos[turnos.length - 1];
@@ -358,12 +365,28 @@ function getRecentHistoryTurns(
     }
   }
 
-  while (turnos.length && turnos[0].role !== "user") {
-    turnos.shift();
+  // La Messages API exige que el primer turno sea `user`. Antes se
+  // descartaban los turnos `assistant` iniciales, pero eso tiraba justo la
+  // campaña a la que la paciente está respondiendo (bug real 2026-09-29: 46
+  // de 52 respuestas a campañas desde el 16/9 se contestaron sin ver la
+  // campaña). Ahora se antepone un turno de contexto en vez de borrarlos.
+  if (turnos.length && turnos[0].role !== "user") {
+    turnos.unshift({ role: "user", content: CONTEXTO_INICIO_CONSULTORIO });
   }
 
   return turnos;
 }
+
+/**
+ * Turno `user` sintético que abre el historial cuando el primer mensaje de la
+ * ventana es del consultorio (campaña, recordatorio, bienvenida). No va
+ * cercado en `<mensaje_paciente>` porque no lo escribió la paciente.
+ */
+const CONTEXTO_INICIO_CONSULTORIO =
+  "[Contexto del sistema, no es un mensaje de la paciente: en esta ventana " +
+  "de la conversación el consultorio escribió primero. Los mensajes " +
+  "siguientes del asistente son lo que el consultorio le mandó antes de " +
+  "que ella respondiera.]";
 
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
