@@ -74,11 +74,15 @@ const MEDIA_PREPROCESSING_POLLING_INTERVAL = 5 * 1000; // 5 seconds
  * el riesgo (nunca confirmado hasta ahora) de agendar el mismo turno dos
  * veces en Calendly.
  *
- * CONVERSATION_LOCK_TTL_SECS está por encima del deadline real de la
- * pipeline en frío (~55s, ver golden set 2026-08-09) — un candado más viejo
- * se considera abandonado (invocación que crasheó) y se puede retomar.
+ * CONVERSATION_LOCK_TTL_SECS = el wall-clock máximo de una Edge Function en
+ * el plan free de Supabase (150s): ninguna invocación viva puede tener el
+ * candado más que eso, así que uno más viejo es seguro de una invocación que
+ * murió y se puede retomar. Con 90s (hasta 2026-09-29) el candado podía
+ * vencer a mitad de un turno largo real (p95 ~86s medido en agent_llm_calls,
+ * 30 días) y dejar entrar a otra invocación en paralelo. Si el proyecto pasa
+ * a un plan pago (límite 400s), revisar este valor.
  */
-const CONVERSATION_LOCK_TTL_SECS = 90;
+const CONVERSATION_LOCK_TTL_SECS = 150;
 const CONVERSATION_LOCK_POLL_MS = 2 * 1000;
 const CONVERSATION_LOCK_MAX_WAIT_MS = 90 * 1000;
 
