@@ -471,7 +471,7 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                falsos positivos en el flujo normal de agendar (
  *                `agendar_falta_mail`). 36/37 aprobados — el resto ya
  *                documentado (Incidente 8/14, sin relación con este cambio).
- *   v26 (pendiente) — Jornadas de IPL/NIR con fechas reales. Incidente real
+ *   v26 (cf007c1) — Jornadas de IPL/NIR con fechas reales. Incidente real
  *                2026-09-29: una paciente respondió a la campaña de IPL "no
  *                puedo esos días, avísenme la próxima" y el bot le contestó
  *                "pasame el día que te venga bien y te agendo", como si IPL
