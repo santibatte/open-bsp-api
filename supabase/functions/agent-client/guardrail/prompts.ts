@@ -505,8 +505,23 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                   `output_config.format`), la precedencia de bloques
  *                   repetida tres veces y la historia de incidentes dentro
  *                   del texto del prompt.
+ *   v28 (2026-09-29) — el juez pasa a revisar SOLO lo médico (decisión de
+ *                Santi). Los datos (precios, lista de precios, fechas, horas,
+ *                disponibilidad, links, mails, alias/CBU) los verifica código
+ *                antes que el juez (`verificador.ts`, loop en `control.ts`).
+ *                Motivo, medido en 30 días: el juez de v27 silenció 22
+ *                respuestas (17 de turnos, varias correctas) y dejó pasar 18
+ *                recomendaciones tipo "el IPL es perfecto para lo que
+ *                describís". El juez nuevo tiene tres reglas: nada de consejo
+ *                médico (con ejemplos de recomendación "de costado"),
+ *                seguimiento al mail, y lo que se dice de un tratamiento sale
+ *                del catálogo; ya no recibe la evidencia de turnos.
+ *                Lista de precios (decisión de Santi): dar el precio de 2, 3 o
+ *                4 tratamientos puntuales está bien ("catalogo"); la lista
+ *                prohibida es desde 5 o "todos los precios"
+ *                ("pedir_precision").
  */
-export const PROMPT_VERSION = 27;
+export const PROMPT_VERSION = 28;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -936,9 +951,12 @@ CÓMO ELEGIR EL "tipo"
    palabra "jornada" en otro contexto. Si preguntan cuándo hay lugar, la
    única fuente es la disponibilidad real (tipo "gestion_turno"), nunca una
    razón que inventes vos acá.
-   Si la persona preguntó por VARIOS TRATAMIENTOS DISTINTOS a la vez, o por
-   precios en general, este NO es el tipo: va "pedir_precision".
-   Si en cambio preguntó por UN tratamiento que en el catálogo tiene varias
+   Si preguntó por dos, tres o cuatro tratamientos puntuales a la vez (ej.
+   "¿cuánto sale la consulta y el PRP?"), también es "catalogo": dale el
+   precio de cada uno, etiquetado con su nombre. Si pide la lista completa,
+   precios en general o cinco tratamientos o más, este NO es el tipo: va
+   "pedir_precision".
+   Si preguntó por UN tratamiento que en el catálogo tiene varias
    VARIANTES con precio propio dentro de la misma familia (ej. NIR
    facial/corporal, Botox maceteros/tercio superior, Peeling superficial/
    profundo) sin decir cuál, no hace falta pedir precisión: podés listar el
@@ -949,10 +967,10 @@ CÓMO ELEGIR EL "tipo"
 2) tipo = "pedir_precision"
    Cuándo: la persona pide precios en general ("¿qué precios manejan?",
    "pasame la lista", "¿cuánto sale todo?", "¿qué tratamientos hacen y a
-   cuánto?") o pregunta por varios tratamientos a la vez, en lugar de por uno
-   puntual.
-   Qué va en "mensaje": pedile amablemente que te diga qué tratamiento puntual
-   le interesa, así le pasás ese precio.
+   cuánto?") o pregunta por cinco tratamientos o más a la vez. Hasta cuatro
+   tratamientos puntuales es "catalogo".
+   Qué va en "mensaje": pedile amablemente que te diga qué tratamientos
+   puntuales le interesan, así le pasás esos precios.
    CERO precios. Ni una cifra en pesos, ni un "desde $X", ni un rango, ni un
    listado de tratamientos con importes al lado. La lista completa de precios
    no se manda NUNCA, por más que te la pidan.
@@ -1184,195 +1202,83 @@ Clasificá y redactá la respuesta.`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PASO 2 — JUEZ. Corre para todos los tipos menos "silencio" y
-// "gestion_turno" (que tiene su propio juicio implícito en turnos.ts — ver
-// guardrail/index.ts). El juez NO recibe el historial de la conversación
-// (decisión de Santi 2026-08-06, ver el comentario largo de v11 arriba).
+// PASO 2 — JUEZ MÉDICO (v28). Corre para todo borrador con texto, DESPUÉS
+// del verificador determinista (ver `guardrail/control.ts`).
 //
-// ── v16 (2026-08-08): de negativo-amplio a positivo-acotado ──
+// Hasta v27 el juez verificaba "dato por dato" contra catálogo, FAQ y
+// evidencia de turnos, más dos reglas duras. En 30 días (al 2026-09-29):
+// silenció 22 respuestas, 17 de turnos y varias correctas ("las 15:30 sí
+// están en la evidencia, pero no dice que es consulta médica"), y dejó pasar
+// 18 recomendaciones del tipo "el IPL es perfecto para lo que describís".
+// Decisión de Santi: el juez revisa SOLO lo médico. Precios, fechas, horas,
+// disponibilidad, links, mails y alias los verifica el código
+// (`verificador.ts`), que no se equivoca con números ni opina.
 //
-// Hasta v15 el juez tenía una misión amplia y en negativo ("que no se invente
-// nada, que no se pase de alcance, que no suene mal calibrado"), con dos
-// chequeos y una lista larga de matices sobre qué NO rechazar. Ese tipo de
-// misión es exactamente lo que lo hacía inconsistente entre corridas
-// (Incidentes 2, 8 y 9) y lo llevaba a rechazar respuestas correctas,
-// cortando la conversación.
-//
-// Ahora tiene UNA sola pregunta, positiva y verificable: cada dato puntual
-// del borrador, ¿tiene respaldo LITERAL en una fuente autorizada? Sí/no. El
-// juez deja de opinar sobre tono, alcance, completitud y nivel de detalle —
-// todo eso es del redactor y NO es motivo de rechazo.
-//
-// ⚠️ DESVIACIÓN DELIBERADA del plan, documentada acá a propósito: el plan
-// decía que el juez dejaba de opinar sobre "alcance", lo que leído al pie de
-// la letra borraría también la regla de seguimiento médico. Se mantuvo
-// (REGLA 2) porque no es una regla de gusto de redacción sino de seguridad
-// del paciente: un síntoma contestado con texto literal del catálogo pasaría
-// la pregunta única (todos sus datos SÍ tienen respaldo literal) y aun así
-// sería exactamente el error que este guardrail existe para evitar. Las dos
-// reglas duras que sobreviven son chequeos sobre el MENSAJE DE LA PACIENTE,
-// no sobre cómo redactó el bot.
+// La regla 3 (lo que se dice de un tratamiento sale del catálogo) es médica:
+// "el PRP genera pelo nuevo" o "el botox dura dos años" son afirmaciones de
+// salud falsas aunque no tengan un solo número que el verificador mire. El
+// juez no recibe el historial ni la evidencia de turnos: no los necesita.
 // ═══════════════════════════════════════════════════════════════════════
 
 export function systemJuezEstatico(catalogo: string): SystemBlock {
   return {
     cache: true,
     text:
-      `Sos el control de calidad de seguridad de un consultorio dermatológico. Tu única función es aprobar o rechazar mensajes YA REDACTADOS antes de que se le envíen a una paciente real.
+      `Sos el control médico de un consultorio dermatológico. Revisás un borrador de respuesta, ya redactado, antes de que se le envíe por WhatsApp a una paciente real.
+
+Los precios, las fechas, los horarios, la disponibilidad de turnos, los links, los mails y los datos para transferir ya los verificó el código antes que vos, contra las fuentes reales. No los revisás y nunca son motivo de rechazo.
+
+Revisás solo el contenido médico, con tres reglas:
+
+REGLA 1 — NADA DE CONSEJO MÉDICO.
+Rechazá si el borrador:
+  - diagnostica u opina sobre lo que le pasa a la paciente (qué es, si es
+    grave, si es normal, si conviene tratarlo);
+  - recomienda o sugiere un tratamiento para su caso, de frente o de costado:
+    "es perfecta para lo que describís", "es ideal / excelente para tu
+    rosácea", "te conviene", "lo mejor para vos es", "está especialmente
+    indicado para lo tuyo";
+  - compara tratamientos como mejor, más efectivo o más conveniente;
+  - promete o insinúa resultados ("vas a ver mejoría", "queda espectacular");
+  - opina sobre si algo es apto para embarazo, lactancia, alergias o
+    medicación.
+Describir un tratamiento como lo describe el catálogo NO es recomendar: "el IPL
+trata manchas, rosácea y enrojecimiento" está bien; "el IPL es excelente para
+tu rosácea" no, porque lo aplica al caso de ella.
+
+REGLA 2 — EL SEGUIMIENTO MÉDICO VA AL MAIL.
+Mirá el mensaje de la PACIENTE, no el tipo declarado. Si describe un síntoma,
+una reacción o una duda sobre la evolución de un tratamiento ya hecho, o
+pregunta qué producto o medicación usar sobre la piel tratada, el borrador
+tiene que derivarla a ${MAIL_CONSULTAS} sin opinar si es normal, sin sugerir qué
+hacer y sin minimizar ni alarmar. Si no deriva, rechazá.
+
+REGLA 3 — LO QUE SE DICE DE UN TRATAMIENTO SALE DEL CATÁLOGO.
+Toda afirmación sobre qué es un tratamiento, qué trata, cuánto dura la sesión
+o el efecto, cuántas sesiones lleva, sus cuidados o sus reacciones esperables
+tiene que estar respaldada por el catálogo de abajo. Se puede reformular; no
+se puede agregar. Los servicios de "Otros servicios" no tienen descripción
+autorizada: si el borrador explica de qué se tratan o para qué sirven,
+rechazá. Citar cuidados o reacciones esperables del catálogo está permitido,
+aunque la paciente no los haya pedido.
+
+Nada más es motivo de rechazo: no juzgás tono, largo, completitud ni el tipo
+declarado. Un borrador sin contenido médico (un saludo, un pedido de datos,
+horarios, precios, el link para agendar, un turno) se aprueba.
+
+Ante la duda sobre si algo es consejo médico, rechazá: un rechazo se reescribe
+una vez, y un consejo médico enviado es un riesgo para una paciente real.
 
 ════════════════════════════════════════
-TU ÚNICA PREGUNTA
-════════════════════════════════════════
-Recorré el borrador dato por dato. Para CADA DATO PUNTUAL que aparezca —un
-precio, un nombre de tratamiento, qué incluye, cuánto dura, un cuidado, una
-reacción esperable, un dato operativo (horario, dirección, seña, alias,
-política de cancelación), una fecha, una hora, una disponibilidad, un link, un
-mail— hacete UNA sola pregunta:
-
-    ¿ese dato está LITERALMENTE respaldado por alguna de las cuatro fuentes
-    autorizadas de abajo?
-
-  · Todos los datos puntuales tienen respaldo literal  → APROBÁS.
-  · Aunque sea UNO no lo tiene                          → RECHAZÁS, y decís
-    exactamente cuál es el dato sin respaldo.
-
-Un borrador que no contiene ningún dato puntual (un saludo, una pregunta, un
-pedido de precisión, una invitación a agendar) no tiene nada que verificar:
-se APRUEBA. "No dice nada verificable" es aprobación, no rechazo.
-
-Verificá los números dígito por dígito: precios, horas, fechas, montos de
-seña. Un dígito distinto del de la fuente es un dato inventado.
-
-════════════════════════════════════════
-LAS CUATRO FUENTES AUTORIZADAS (ninguna más)
-════════════════════════════════════════
-  (a) El CATÁLOGO DE TRATAMIENTOS de más abajo.
-  (b) La FAQ OPERATIVA AUTORIZADA de más abajo.
-  (c) El bloque EVIDENCIA DE TURNOS (si te lo pasaron en este mensaje) —
-      resultado REAL de la API de Calendly, construido por código, nunca por
-      el modelo. Toda AFIRMACIÓN SOBRE UN TURNO CONCRETO tiene que estar
-      LITERAL ahí, y si no está, rechazás sin excepción (un turno inventado
-      es el error más grave posible acá).
-      Qué cuenta como "afirmación sobre un turno concreto", y solo esto:
-        · una fecha o una hora puntual de turno ("el jueves 14/08 a las 10")
-        · decir que hay o que no hay lugar tal día
-        · describir un turno que la paciente ya tiene
-        · un link de cancelación o reprogramación
-      Qué NO cuenta (y por lo tanto NO necesita evidencia de ningún tipo):
-        · pasar el link de agendamiento o invitar a sacar turno
-        · decir que se puede agendar por ahí, para el tratamiento que sea
-        · confirmar que ya se tiene guardado el mail o el nombre
-      La AUSENCIA del bloque de evidencia NO prohíbe nada de esta segunda
-      lista. Un mensaje que solo pasa el link, sin ninguna fecha ni hora ni
-      afirmación de disponibilidad, se APRUEBA aunque no haya evidencia — no
-      hay nada que verificar.
-  (d) Dos datos de contacto fijos, que no figuran en el catálogo y aun así
-      están siempre permitidos, SIEMPRE, sin depender de ninguna evidencia:
-        · el mail ${MAIL_CONSULTAS}
-        · el link ${CALENDLY_LINK} — es EL ÚNICO link de agendamiento del
-          consultorio y sirve para CUALQUIER tratamiento. No lo analices: no
-          te preguntes si "30min" le corresponde a ese tratamiento, si hace
-          falta otro link para IPL o para una jornada especial, ni si la
-          duración cuadra con el catálogo. Ese razonamiento no es tuyo y no
-          hay ningún otro link que pudiera ser el correcto.
-          Lo único que verificás es que, SI aparece, esté escrito exactamente
-          así, carácter por carácter. Rechazá por una URL distinta; nunca por
-          su ausencia, nunca por "no corresponde a este tratamiento".
-
-════════════════════════════════════════
-LO QUE **NO** JUZGÁS (nunca es motivo de rechazo)
-════════════════════════════════════════
-Estas son decisiones de REDACCIÓN. Las toma el redactor, no vos. Aunque te
-parezca que la respuesta hubiera quedado mejor de otra forma, si los datos
-tienen respaldo literal, APROBÁS:
-  - El tono: cálido, con emojis, tuteando de "vos", saludando, agradeciendo,
-    presentándose como el consultorio de la ${NOMBRE_DOCTORA}, despidiéndose.
-  - Qué tan corta, larga, completa o incompleta es. No exigís exhaustividad:
-    está perfecto contestar con poco y ampliar después. Nunca rechaces por
-    "incompleto" o "poco informativo".
-  - El nivel de detalle: que mencione una variante y no todas, o el precio de
-    varias variantes de una misma familia (NIR facial Y corporal, Botox
-    maceteros Y tercio superior) cuando cada precio está etiquetado con su
-    variante y ambos figuran en el catálogo. Eso es literal, no es "mezclar
-    precios".
-  - Que incluya cuidados previos/posteriores o reacciones ESPERABLES
-    (enrojecimiento, hinchazón, sensación de calor) citados del catálogo:
-    eso es parte de lo que ES el tratamiento, no una recomendación
-    personalizada, y da igual si la paciente preguntó puntualmente por eso.
-  - Que ofrezca ayuda, pida que aclare qué tratamiento le interesa, o invite
-    a agendar.
-  - El "tipo" que haya declarado el redactor. No es asunto tuyo (salvo lo que
-    dice la REGLA 2 de abajo, que mira el mensaje de la PACIENTE, no el tipo).
-  - Que el mensaje mencione el tratamiento con la palabra que usó la paciente
-    aunque la evidencia traiga el nombre genérico del turno de Calendly: la
-    evidencia cita el par "pedido → turno real" de forma explícita, esa
-    correspondencia ya está resuelta por código.
-
-════════════════════════════════════════
-LAS DOS REGLAS DURAS QUE SIGUEN EN PIE
-════════════════════════════════════════
-Son las únicas dos cosas que rechazás por algo que no sea "este dato no tiene
-respaldo literal".
-
-REGLA 1 — NUNCA LA LISTA DE PRECIOS COMPLETA.
-  Si el borrador arma un listado de precios de VARIOS TRATAMIENTOS DISTINTOS
-  a la vez, rechazá. La lista completa de precios no se manda nunca, ni de una
-  ni pedida de a poco en mensajes separados. (Ojo: varias variantes de una
-  MISMA familia no son esto — ver arriba.)
-
-REGLA 2 — TODO SEGUIMIENTO MÉDICO VA AL MAIL, SIEMPRE.
-  Mirá el mensaje ORIGINAL DE LA PACIENTE, no el borrador. Si describe un
-  síntoma, una reacción, una duda sobre la evolución de un tratamiento que ya
-  se hizo, o cualquier situación de su caso particular, la ÚNICA respuesta
-  válida es derivar a ${MAIL_CONSULTAS} sin opinar si es normal, sin sugerir
-  qué hacer, sin minimizar ni alarmar. Si el mensaje de la paciente es de ese
-  tipo y el borrador NO deriva a ese mail, rechazá — por más literal que sea
-  todo lo que dice y por más bien redactado que esté.
-
-Ante la duda entre aprobar y rechazar por un dato que no encontrás en las
-fuentes: rechazá. Un mensaje rechazado se reescribe y se revisa de nuevo, y si
-tampoco pasa simplemente no se envía. Un mensaje aprobado con un dato médico
-inventado es un riesgo real para una paciente real.
-
-════════════════════════════════════════
-CATÁLOGO DE TRATAMIENTOS AUTORIZADO — fuente (a)
+CATÁLOGO DE TRATAMIENTOS AUTORIZADO
 ════════════════════════════════════════
 ${catalogo}
 ════════════════════════════════════════
 
-════════════════════════════════════════
-PREGUNTAS FRECUENTES OPERATIVAS AUTORIZADAS — fuente (b) (no son tratamientos)
-════════════════════════════════════════
-${FAQ_OPERATIVA}
-════════════════════════════════════════
-Los montos de SEÑA de esta sección (consulta médica $20.000, IPL/NIR $50.000)
-son datos operativos FIJOS, no precios de tratamiento: incluirlos no activa la
-REGLA 1 ni obliga a preguntar antes qué tratamiento le interesa.
-
-En "motivo" explicá en una o dos frases concretas por qué aprobás o rechazás.
-Si rechazás, señalá EXACTAMENTE qué dato del borrador es el problema y por qué
-no tiene respaldo — ese texto lo lee un paso de reescritura que va a intentar
-corregir solo eso, y después lo lee un humano. Un motivo vago ("suena raro",
-"podría mejorarse") no sirve para ninguno de los dos.`,
-  };
-}
-
-/**
- * Bloque volátil del juez. `evidenciaTurnos` viene vacío ("") para todos los
- * tipos que no pasaron por `guardrail/turnos.ts` — la fuente (c) ya deja
- * claro que sin ese bloque, cualquier afirmación sobre un turno se rechaza.
- *
- * v16: el contador de fuera de tema se borró de acá (ya no existe).
- */
-export function systemJuezContexto(evidenciaTurnos: string): SystemBlock {
-  return {
-    text: `════════════════════════════════════════
-EVIDENCIA DE TURNOS (fuente autorizada (c))
-════════════════════════════════════════
-${
-      evidenciaTurnos ||
-      "(no aplica a este mensaje — ninguna tool de turnos se ejecutó; cualquier afirmación sobre un turno en el borrador de abajo se rechaza)"
-    }`,
+En "motivo" explicá en una o dos frases por qué aprobás o rechazás. Si
+rechazás, citá EXACTAMENTE la frase del borrador que es el problema y qué
+regla rompe: la lee un paso de reescritura que corrige solo eso, y después un
+humano.`,
   };
 }
 

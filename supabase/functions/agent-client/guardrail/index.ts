@@ -66,26 +66,17 @@ import {
 } from "./catalogo.ts";
 import {
   type DatosContactoGuardados,
-  type SalidaJuez,
   type SalidaRedactor,
-  type SalidaReescritura,
-  SCHEMA_JUEZ,
   SCHEMA_REDACTOR,
-  SCHEMA_REESCRITURA,
   SUB_ESTADO_INICIAL,
   type SubEstadoAgendamiento,
-  systemJuezContexto,
-  systemJuezEstatico,
   systemRedactorBloques,
   systemRedactorContexto,
-  systemReescrituraContexto,
-  systemReescrituraEstatico,
   textoJornadasIpl,
   type TipoRespuesta,
-  userJuez,
   userRedactor,
-  userReescritura,
 } from "./prompts.ts";
+import { controlarBorrador } from "./control.ts";
 import {
   aplicarOverrideEtapaSobreTipo,
   calcularSubEstadoParaLlamado,
@@ -835,162 +826,49 @@ export async function runGuardrail(
     return { enviado: false, tipo: redactor.tipo, motivo: "borrador vacío" };
   }
 
-  // ══════════════ PASO 2 — JUEZ (+ 1 REESCRITURA) ══════════════
+  // ══════════════ PASO 2 — CONTROL (verificador + juez médico) ══════════════
   //
-  // El juez NO recibe el historial de la conversación (decisión de Santi
-  // 2026-08-06, anotada para revisar por optimización más adelante — ver
-  // proyectos/P05_plan_tools_turnos.md sección 7 punto 9): evalúa solo el
-  // mensaje puntual + la evidencia de turnos, si la hay.
+  // `controlarBorrador` (control.ts): el verificador en código revisa los
+  // datos (precios, fechas, horas, links, mails, alias) y el juez solo lo
+  // médico; si alguno rechaza, UNA reescritura y se revisa de nuevo. Segundo
+  // rechazo = silencio (fail-closed), con motivo `rechazado 2 veces por el
+  // verificador|juez` para poder medir cuál de los dos frena más.
   //
-  // v16 — LOOP DE REESCRITURA: si el juez rechaza, se hace UN llamado corto
-  // que corrige específicamente el motivo señalado y el juez revisa esa
-  // segunda versión. Si vuelve a rechazar, recién ahí es silencio real
-  // (fail-closed, igual que siempre), logueado con un motivo distinguible
-  // (`rechazado 2 veces`) para poder medir la frecuencia: si aparece seguido,
-  // la señal es que hay que seguir acotando al juez, no agregar otra capa
-  // (ver el plan, sección 2).
-
-  // Las jornadas de IPL que vio el redactor también son evidencia (c) para
-  // el juez: si no, rechazaría las fechas que el redactor tiene permitido dar.
-  const evidenciaJuez = [evidenciaTurnos, jornadasIpl]
+  // Las jornadas de IPL que vio el redactor también son evidencia: si no, el
+  // verificador rechazaría las fechas que el redactor tiene permitido dar.
+  const evidencia = [evidenciaTurnos, jornadasIpl]
     .filter(Boolean)
     .join("\n\n");
 
-  let mensajeFinal = redactor.mensaje;
-  let juez: SalidaJuez;
-  let yaSeReescribio = false;
+  const control = await controlarBorrador({
+    llamado,
+    catalogo,
+    evidencia,
+    mensajePaciente,
+    historial,
+    tipo: redactor.tipo,
+    borrador: redactor.mensaje,
+    onLlamadoJuez: hookCosto({ ...costoBase, step: "juez" }),
+    onLlamadoReescritura: hookCosto({ ...costoBase, step: "reescritura" }),
+  });
 
-  while (true) {
-    try {
-      juez = await callStructured<SalidaJuez>({
-        ...llamado,
-        system: [
-          systemJuezEstatico(catalogo),
-          systemJuezContexto(evidenciaJuez),
-        ],
-        messages: [
-          {
-            role: "user",
-            content: userJuez(mensajePaciente, redactor.tipo, mensajeFinal),
-          },
-        ],
-        schema: SCHEMA_JUEZ,
-        onLlamado: hookCosto({ ...costoBase, step: "juez" }),
-      });
-    } catch (error) {
-      const detalle = error instanceof GuardrailLLMError
-        ? error.message
-        : String(error);
-
-      log.error("Falló el juez. No se responde nada.", detalle);
-
-      await registrarNoEnviada(client, conversation, contact, {
-        mensajePaciente,
-        tipo: redactor.tipo,
-        mensajeBorrador: mensajeFinal,
-        motivo: `error técnico en el juez: ${detalle}`,
-      });
-
-      return {
-        enviado: false,
-        tipo: redactor.tipo,
-        motivo: "error en el juez",
-      };
-    }
-
-    log.info("Guardrail — juez", {
-      aprobado: juez.aprobado,
-      reescrito: yaSeReescribio,
-      motivo: juez.motivo,
+  if (!control.enviar) {
+    await registrarNoEnviada(client, conversation, contact, {
+      mensajePaciente,
+      tipo: redactor.tipo,
+      mensajeBorrador: control.mensaje,
+      motivo: control.motivoRegistro,
     });
 
-    if (juez.aprobado) break;
-
-    // ── Segundo rechazo: silencio real (fail-closed) ──
-    if (yaSeReescribio) {
-      const motivo = `rechazado 2 veces por el juez: ${juez.motivo}`;
-
-      await registrarNoEnviada(client, conversation, contact, {
-        mensajePaciente,
-        tipo: redactor.tipo,
-        mensajeBorrador: mensajeFinal,
-        motivo,
-      });
-
-      return { enviado: false, tipo: redactor.tipo, motivo };
-    }
-
-    // ── Primer rechazo: una sola reescritura acotada ──
-    let reescritura: SalidaReescritura;
-
-    try {
-      reescritura = await callStructured<SalidaReescritura>({
-        ...llamado,
-        system: [
-          systemReescrituraEstatico(catalogo),
-          systemReescrituraContexto(evidenciaJuez),
-        ],
-        messages: [
-          {
-            role: "user",
-            content: userReescritura(
-              mensajePaciente,
-              mensajeFinal,
-              juez.motivo,
-            ),
-          },
-        ],
-        schema: SCHEMA_REESCRITURA,
-        onLlamado: hookCosto({ ...costoBase, step: "reescritura" }),
-      });
-    } catch (error) {
-      const detalle = error instanceof GuardrailLLMError
-        ? error.message
-        : String(error);
-
-      log.error("Falló la reescritura. No se responde nada.", detalle);
-
-      await registrarNoEnviada(client, conversation, contact, {
-        mensajePaciente,
-        tipo: redactor.tipo,
-        mensajeBorrador: mensajeFinal,
-        motivo:
-          `rechazado por el juez (${juez.motivo}) y falló la reescritura: ${detalle}`,
-      });
-
-      return {
-        enviado: false,
-        tipo: redactor.tipo,
-        motivo: "error en la reescritura",
-      };
-    }
-
-    if (!reescritura.mensaje?.trim()) {
-      await registrarNoEnviada(client, conversation, contact, {
-        mensajePaciente,
-        tipo: redactor.tipo,
-        mensajeBorrador: mensajeFinal,
-        motivo:
-          `rechazado por el juez (${juez.motivo}) y la reescritura vino vacía`,
-      });
-
-      return {
-        enviado: false,
-        tipo: redactor.tipo,
-        motivo: "reescritura vacía",
-      };
-    }
-
-    log.info("Guardrail — reescritura aplicada", { motivo: juez.motivo });
-
-    mensajeFinal = reescritura.mensaje;
-    yaSeReescribio = true;
+    return { enviado: false, tipo: redactor.tipo, motivo: control.motivo };
   }
+
+  let mensajeFinal = control.mensaje;
 
   // ── Aprobado: se manda de verdad ──
   //
   // `mensajeFinal` es el borrador original o su reescritura, según qué versión
-  // haya aprobado el juez. Nunca se envía nada que no haya pasado por él.
+  // aprobó el control. Nunca se envía nada que no haya pasado por él.
   //
   // Antes de enviar: si el mensaje aprobado incluye el link genérico Y la
   // consulta es sobre una jornada con evento propio (IPL/luz pulsada,
@@ -1030,8 +908,8 @@ export async function runGuardrail(
   return {
     enviado: true,
     tipo: redactor.tipo,
-    motivo: yaSeReescribio
-      ? `aprobado tras reescritura: ${juez.motivo}`
-      : juez.motivo,
+    motivo: control.reescrito
+      ? `aprobado tras reescritura: ${control.motivo}`
+      : control.motivo,
   };
 }

@@ -190,6 +190,18 @@ const CASOS_OK: [string, string, Partial<FuentesVerificacion>?][] = [
     { evidencia: EV_DISPONIBLE },
   ],
   [
+    "'hoy' suelto no afirma nada (falso positivo del backtest)",
+    "¡Hola! ¿En qué te puedo ayudar hoy? 😊",
+  ],
+  [
+    "'mañana o pasado' sin hora no afirma nada (falso positivo del backtest)",
+    "¿Qué día te vendría bien? Decime si preferís mañana o pasado mañana.",
+  ],
+  [
+    "alias real, dicho de otra forma",
+    "Podés transferir la seña al alias: melidermato 😊",
+  ],
+  [
     "cantidad de sesiones y rangos no son horas ni precios",
     "Son 3-5 sesiones cada 3-4 semanas, de 20-40 minutos.",
   ],
@@ -338,6 +350,22 @@ const CASOS_MAL: [
     "mail parecido al de la doctora",
     "Escribile a melisa.altavista@gmail.com",
     ["mail"],
+  ],
+  [
+    "alias inventado para la seña",
+    "Para reservar transferí la seña al alias MELI.DERMA.OK 😊",
+    ["dato_de_pago"],
+  ],
+  [
+    "CBU inventado",
+    "Transferí la seña al CBU 0000003100012345678901.",
+    ["dato_de_pago"],
+  ],
+  [
+    "'mañana' con hora que no está en la evidencia",
+    "Mañana a las 18:00 tengo lugar.",
+    ["hora"],
+    { evidencia: EV_MANANA },
   ],
   [
     "prompt injection: precio de $1",

@@ -51,6 +51,10 @@ import {
   GuardrailLLMError,
   type GuardrailTurn,
 } from "../agent-client/guardrail/anthropic.ts";
+import {
+  controlarBorrador,
+  revisarBorrador,
+} from "../agent-client/guardrail/control.ts";
 import { agregarTurnoFinal } from "../agent-client/guardrail/index.ts";
 import {
   aplicarOverrideEtapaSobreTipo,
@@ -62,24 +66,14 @@ import { cargarCatalogo } from "../agent-client/guardrail/catalogo.ts";
 import {
   type DatosContactoGuardados,
   type EtapaConversacion,
-  type SalidaJuez,
   type SalidaRedactor,
-  type SalidaReescritura,
-  SCHEMA_JUEZ,
   SCHEMA_REDACTOR,
-  SCHEMA_REESCRITURA,
   SUB_ESTADO_INICIAL,
   type SubEstadoAgendamiento,
-  systemJuezContexto,
-  systemJuezEstatico,
   systemRedactorBloques,
   systemRedactorContexto,
-  systemReescrituraContexto,
-  systemReescrituraEstatico,
   type TipoRespuesta,
-  userJuez,
   userRedactor,
-  userReescritura,
 } from "../agent-client/guardrail/prompts.ts";
 import { clasificarEtapa } from "../agent-client/guardrail/etapa.ts";
 
@@ -932,28 +926,34 @@ async function correrCaso(
 
   const datosGuardados = caso.datosGuardados ?? SIN_DATOS_GUARDADOS;
 
-  // ── Atajo: test directo del juez, sin redactor ni turnos.ts ──
+  // ── Atajo: test directo del control (verificador + juez), sin redactor ni
+  // turnos.ts. Desde v28 usa `revisarBorrador` de producción: la evidencia
+  // la chequea el verificador, no el juez. ──
   if (caso.juezDirecto) {
-    let juez: SalidaJuez;
-
     try {
-      juez = await callStructured<SalidaJuez>({
-        apiKey,
-        system: [
-          systemJuezEstatico(catalogo),
-          systemJuezContexto(caso.juezDirecto.evidenciaTurnos),
-        ],
-        messages: [{
-          role: "user",
-          content: userJuez(
-            caso.mensajePaciente,
-            caso.juezDirecto.tipo,
-            caso.juezDirecto.mensajeBorrador,
-          ),
-        }],
-        schema: SCHEMA_JUEZ,
-        onLlamado: hookCosto({ ...costoBase, step: "juez" }),
-      });
+      const { rechazo, motivoJuez } = await revisarBorrador(
+        {
+          llamado: { apiKey },
+          catalogo,
+          evidencia: caso.juezDirecto.evidenciaTurnos,
+          mensajePaciente: caso.mensajePaciente,
+          historial: caso.historialTurnos ?? [],
+          tipo: caso.juezDirecto.tipo,
+          borrador: caso.juezDirecto.mensajeBorrador,
+          ahora: caso.ahora,
+          onLlamadoJuez: hookCosto({ ...costoBase, step: "juez" }),
+        },
+        caso.juezDirecto.mensajeBorrador,
+      );
+
+      return {
+        ...base,
+        tipo: caso.juezDirecto.tipo,
+        mensajeBorrador: caso.juezDirecto.mensajeBorrador,
+        evidenciaTurnos: caso.juezDirecto.evidenciaTurnos,
+        aprobado: !rechazo,
+        motivoJuez: rechazo ? `[${rechazo.por}] ${rechazo.motivo}` : motivoJuez,
+      };
     } catch (error) {
       return {
         ...base,
@@ -965,15 +965,6 @@ async function correrCaso(
         }`,
       };
     }
-
-    return {
-      ...base,
-      tipo: caso.juezDirecto.tipo,
-      mensajeBorrador: caso.juezDirecto.mensajeBorrador,
-      evidenciaTurnos: caso.juezDirecto.evidenciaTurnos,
-      aprobado: juez.aprobado,
-      motivoJuez: juez.motivo,
-    };
   }
 
   // ── PASO 0 — etapa (v16). Fail-soft, igual que en producción. ──
@@ -1123,93 +1114,45 @@ async function correrCaso(
     evidenciaTurnos,
   };
 
-  let mensajeFinal = mensajeBorrador;
-  let yaSeReescribio = false;
+  const control = await controlarBorrador({
+    llamado: { apiKey },
+    catalogo,
+    evidencia: evidenciaTurnos,
+    mensajePaciente: caso.mensajePaciente,
+    historial: caso.historialTurnos ?? [],
+    tipo: redactor.tipo,
+    borrador: mensajeBorrador,
+    ahora: caso.ahora,
+    onLlamadoJuez: hookCosto({ ...costoBase, step: "juez" }),
+    onLlamadoReescritura: hookCosto({ ...costoBase, step: "reescritura" }),
+  });
 
-  while (true) {
-    let juez: SalidaJuez;
-
-    try {
-      juez = await callStructured<SalidaJuez>({
-        apiKey,
-        system: [
-          systemJuezEstatico(catalogo),
-          systemJuezContexto(evidenciaTurnos),
-        ],
-        messages: [{
-          role: "user",
-          content: userJuez(caso.mensajePaciente, redactor.tipo, mensajeFinal),
-        }],
-        schema: SCHEMA_JUEZ,
-        onLlamado: hookCosto({ ...costoBase, step: "juez" }),
-      });
-    } catch (error) {
-      return {
-        ...parcial,
-        mensajeBorrador: mensajeFinal,
-        reescrito: yaSeReescribio,
-        error: `juez: ${
-          error instanceof GuardrailLLMError ? error.message : String(error)
-        }`,
-      };
-    }
-
-    if (juez.aprobado || yaSeReescribio) {
-      return {
-        ...parcial,
-        mensajeBorrador: mensajeFinal,
-        ...(yaSeReescribio ? { borradorOriginal: mensajeBorrador } : {}),
-        reescrito: yaSeReescribio,
-        aprobado: juez.aprobado,
-        motivoJuez: juez.motivo,
-      };
-    }
-
-    parcial.motivoPrimerRechazo = juez.motivo;
-
-    let reescritura: SalidaReescritura;
-
-    try {
-      reescritura = await callStructured<SalidaReescritura>({
-        apiKey,
-        system: [
-          systemReescrituraEstatico(catalogo),
-          systemReescrituraContexto(evidenciaTurnos),
-        ],
-        messages: [{
-          role: "user",
-          content: userReescritura(
-            caso.mensajePaciente,
-            mensajeFinal,
-            juez.motivo,
-          ),
-        }],
-        schema: SCHEMA_REESCRITURA,
-        onLlamado: hookCosto({ ...costoBase, step: "reescritura" }),
-      });
-    } catch (error) {
-      return {
-        ...parcial,
-        mensajeBorrador: mensajeFinal,
-        reescrito: false,
-        error: `reescritura: ${
-          error instanceof GuardrailLLMError ? error.message : String(error)
-        }`,
-      };
-    }
-
-    if (!reescritura.mensaje?.trim()) {
-      return {
-        ...parcial,
-        mensajeBorrador: mensajeFinal,
-        reescrito: false,
-        error: "la reescritura vino vacía",
-      };
-    }
-
-    mensajeFinal = reescritura.mensaje;
-    yaSeReescribio = true;
+  if (control.primerRechazo) {
+    parcial.motivoPrimerRechazo =
+      `[${control.primerRechazo.por}] ${control.primerRechazo.motivo}`;
   }
+
+  if (control.enviar) {
+    return {
+      ...parcial,
+      mensajeBorrador: control.mensaje,
+      ...(control.reescrito ? { borradorOriginal: mensajeBorrador } : {}),
+      reescrito: control.reescrito,
+      aprobado: true,
+      motivoJuez: control.motivo,
+    };
+  }
+
+  const esError = !control.motivoRegistro.startsWith("rechazado 2 veces");
+
+  return {
+    ...parcial,
+    mensajeBorrador: control.mensaje,
+    reescrito: !!control.primerRechazo,
+    ...(esError
+      ? { error: control.motivoRegistro }
+      : { aprobado: false, motivoJuez: control.motivoRegistro }),
+  };
 }
 
 /**

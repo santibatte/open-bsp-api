@@ -41,7 +41,6 @@ import {
   SUB_ESTADOS_AGENDAMIENTO,
   systemAgenteTurnosEstatico,
   systemEtapa,
-  systemJuezContexto,
   systemJuezEstatico,
   systemRedactorBloques,
   systemRedactorContexto,
@@ -84,9 +83,9 @@ function promptRedactorCompleto(
     systemRedactorContexto(datosGuardados, etapa).text;
 }
 
-function promptJuezCompleto(catalogo: string, evidenciaTurnos = ""): string {
-  return systemJuezEstatico(catalogo).text + "\n" +
-    systemJuezContexto(evidenciaTurnos).text;
+// v28: el juez no tiene bloque de contexto (ya no recibe evidencia de turnos).
+function promptJuezCompleto(catalogo: string): string {
+  return systemJuezEstatico(catalogo).text;
 }
 
 const SQL_GUARDRAILS = new URL(
@@ -251,6 +250,25 @@ Deno.test("pedir_precision le prohíbe al redactor cualquier cifra", () => {
   );
 });
 
+Deno.test("v28: 2 a 4 tratamientos puntuales llevan precio; la lista es desde 5", () => {
+  const prompt = promptRedactorCompleto(CATALOGO_FALSO);
+
+  const catalogo = prompt.slice(
+    prompt.indexOf('tipo = "catalogo"'),
+    prompt.indexOf('tipo = "pedir_precision"'),
+  );
+  assert(
+    /dos, tres o cuatro tratamientos puntuales/i.test(catalogo),
+    "catalogo tiene que cubrir 2 a 4 tratamientos (decisión de Santi 2026-09-29)",
+  );
+
+  const pedir = prompt.slice(
+    prompt.indexOf('tipo = "pedir_precision"'),
+    prompt.indexOf('tipo = "faq"'),
+  );
+  assert(/cinco tratamientos o más/i.test(pedir));
+});
+
 Deno.test("el redactor inyecta la FAQ operativa y explica el tipo faq", () => {
   const prompt = promptRedactorCompleto(CATALOGO_FALSO);
 
@@ -387,225 +405,78 @@ Deno.test("v16: saludo_generico absorbe todo fuera de tema, sin contador ni esca
   );
 });
 
-// ════════════════════ Prompt del JUEZ ════════════════════
+// ════════════════════ Prompt del JUEZ (v28: solo médico) ════════════════════
 //
-// v16: el juez pasó de dos chequeos negativos a UNA pregunta positiva
-// ("¿cada dato puntual tiene respaldo literal?") + dos reglas duras. Los
-// tests siguen la misma idea de antes: verificar que las piezas que NO se
-// pueden perder en un refactor de texto sigan ahí.
+// v28: los datos (precios, fechas, horas, links, mails, alias) los verifica
+// `verificador.ts`; el juez revisa solo lo médico. Estos tests fijan las
+// piezas que no se pueden perder en un refactor de texto, y que el juez no
+// vuelva a juzgar datos (la causa de los falsos rechazos de turnos).
 
-Deno.test("el juez autoriza explícitamente el mail Y el link de Calendly", () => {
+Deno.test("v28: el juez tiene las tres reglas médicas", () => {
   const prompt = promptJuezCompleto(CATALOGO_FALSO);
 
-  const inicio = prompt.indexOf("LAS CUATRO FUENTES AUTORIZADAS");
-  const fin = prompt.indexOf("LO QUE **NO** JUZGÁS");
-
-  assert(inicio > 0 && fin > inicio, "falta el bloque de fuentes autorizadas");
-
-  const bloque = prompt.slice(inicio, fin);
-
-  // Sin esto el juez rechaza todo saludo correcto por "dato que no está en el
-  // catálogo": el link y el mail no figuran en precios_vigentes.
-  assert(bloque.includes(MAIL_CONSULTAS), "el mail no está autorizado");
+  assert(/REGLA 1 — NADA DE CONSEJO MÉDICO/.test(prompt));
+  assert(/REGLA 2 — EL SEGUIMIENTO MÉDICO VA AL MAIL/.test(prompt));
   assert(
-    bloque.includes(CALENDLY_LINK),
-    "el link de Calendly no está autorizado",
+    /REGLA 3 — LO QUE SE DICE DE UN TRATAMIENTO SALE DEL CATÁLOGO/.test(prompt),
   );
   assert(
-    /nunca por\s+su ausencia/i.test(bloque),
-    "falta la aclaración de que el link NO es obligatorio (v15)",
-  );
-
-  // v17: el juez rechazó un link correcto argumentando que "/30min es para
-  // consultas de 30 minutos, no para IPL". El link es uno solo y sirve para
-  // todo — el juez no razona sobre él, solo lo compara carácter por carácter.
-  assert(
-    /No lo analices/i.test(bloque),
-    "falta la prohibición de razonar sobre el link (v17)",
+    prompt.includes(MAIL_CONSULTAS),
+    "la regla 2 tiene que nombrar el mail",
   );
   assert(
-    /nunca por "no corresponde a este tratamiento"/i.test(bloque),
-    "falta la prohibición de rechazar el link por 'no corresponde al tratamiento' (v17)",
+    /embarazo,\s+lactancia,\s+alergias\s+o\s+medicación/i.test(prompt),
+    "se perdió la regla sobre embarazo/lactancia/alergias/medicación",
   );
 });
 
-Deno.test("v17: sin evidencia de turnos, pasar el link igual se aprueba", () => {
+Deno.test("v28: el juez nombra la recomendación 'de costado' que dejaba pasar", () => {
   const prompt = promptJuezCompleto(CATALOGO_FALSO);
 
-  const inicio = prompt.indexOf("LAS CUATRO FUENTES AUTORIZADAS");
-  const fin = prompt.indexOf("LO QUE **NO** JUZGÁS");
-  const bloque = prompt.slice(inicio, fin);
-
-  // El bug más caro de v16: el juez leía "sin evidencia, cualquier afirmación
-  // sobre un turno es inventada" y lo estiraba hasta prohibir el link, con lo
-  // que el pedido de turno genérico —de los mensajes más frecuentes del
-  // consultorio— terminaba en silencio.
-  assert(
-    /Qué NO cuenta/i.test(bloque),
-    "el juez tiene que tener la lista de lo que NO necesita evidencia (v17)",
-  );
-  assert(
-    /pasar el link de agendamiento o invitar a sacar turno/i.test(bloque),
-    "pasar el link tiene que estar explícitamente fuera de lo que exige evidencia",
-  );
-  assert(
-    /La AUSENCIA del bloque de evidencia NO prohíbe/i.test(bloque),
-    "falta la aclaración de que la ausencia de evidencia no prohíbe el link",
-  );
-});
-
-Deno.test("el juez tiene UNA pregunta positiva, no una lista de chequeos", () => {
-  const prompt = promptJuezCompleto(CATALOGO_FALSO);
-
-  assert(
-    prompt.includes("TU ÚNICA PREGUNTA"),
-    "se perdió la pregunta única del juez (v16)",
-  );
-  assert(
-    /respaldado por alguna de las cuatro fuentes/i.test(prompt),
-    "la pregunta única tiene que ser sobre respaldo literal en las fuentes",
-  );
-  assert(
-    /no tiene nada que verificar:\s*\n?se APRUEBA/i.test(prompt) ||
-      /no contiene ningún dato puntual/i.test(prompt),
-    "falta la regla de que un mensaje sin datos puntuales se aprueba",
-  );
-  assert(
-    !prompt.includes("CHEQUEO 1") && !prompt.includes("CHEQUEO 2"),
-    "los dos chequeos de v9-v15 deberían haber desaparecido en v16",
-  );
-});
-
-Deno.test("el juez trata la evidencia de turnos como fuente autorizada", () => {
-  const prompt = promptJuezCompleto(CATALOGO_FALSO);
-
-  const inicio = prompt.indexOf("LAS CUATRO FUENTES AUTORIZADAS");
-  const fin = prompt.indexOf("LO QUE **NO** JUZGÁS");
-  const bloque = prompt.slice(inicio, fin);
-
-  assert(
-    /EVIDENCIA DE TURNOS/.test(bloque),
-    "falta la fuente autorizada (c) EVIDENCIA DE TURNOS",
-  );
-  assert(
-    /error más grave posible/i.test(bloque),
-    "falta el énfasis de que un turno inventado es la forma más peligrosa de invención",
-  );
-});
-
-Deno.test("el bloque de contexto del juez incluye la evidencia de turnos pasada", () => {
-  const evidencia = "- Botox, 20/08/2026 11:00 (event_uuid=evt-123).";
-  const prompt = promptJuezCompleto(CATALOGO_FALSO, evidencia);
-
-  assert(
-    prompt.includes(evidencia),
-    "la evidencia de turnos pasada como argumento no aparece en el prompt",
-  );
-});
-
-Deno.test("sin evidencia de turnos, el contexto del juez avisa que se rechaza cualquier afirmación de turno", () => {
-  const prompt = promptJuezCompleto(CATALOGO_FALSO, "");
-
-  assert(
-    /ninguna tool de turnos se ejecutó/i.test(prompt),
-    "falta el aviso de que sin evidencia, cualquier afirmación sobre un turno se rechaza",
-  );
-});
-
-Deno.test("las dos reglas duras del juez sobreviven a la relajación de v16", () => {
-  const prompt = promptJuezCompleto(CATALOGO_FALSO);
-
-  const inicio = prompt.indexOf("LAS DOS REGLAS DURAS QUE SIGUEN EN PIE");
-
-  assert(inicio > 0, "falta el bloque de reglas duras");
-
-  const bloque = prompt.slice(inicio);
-
-  // REGLA 1 — es la única protección real contra filtrar el catálogo entero.
-  assert(
-    /VARIOS TRATAMIENTOS DISTINTOS/i.test(bloque),
-    "se perdió la regla de no armar la lista completa de precios",
-  );
-  assert(
-    /ni de una\s+ni pedida de a poco/i.test(bloque),
-    "falta la aclaración de que tampoco se filtra la lista de a poco",
-  );
-
-  // REGLA 2 — se mantuvo a propósito pese a ser "de alcance": es seguridad
-  // del paciente, no gusto de redacción (ver la nota de diseño en prompts.ts).
-  assert(
-    bloque.includes(MAIL_CONSULTAS),
-    "la regla de seguimiento médico tiene que derivar al mail de la doctora",
-  );
-  assert(
-    /mensaje ORIGINAL DE LA PACIENTE/i.test(bloque),
-    "la regla de seguimiento tiene que mirar el mensaje de la paciente, no el tipo declarado",
-  );
-});
-
-Deno.test("el juez ya NO juzga tono, completitud ni nivel de detalle", () => {
-  const prompt = promptJuezCompleto(CATALOGO_FALSO);
-
-  const inicio = prompt.indexOf("LO QUE **NO** JUZGÁS");
-  const fin = prompt.indexOf("LAS DOS REGLAS DURAS QUE SIGUEN EN PIE");
-
-  assert(inicio > 0 && fin > inicio, "falta el bloque de lo que no se juzga");
-
-  const bloque = prompt.slice(inicio, fin);
-
-  for (
-    const frase of [
-      "El tono",
-      "El nivel de detalle",
-      "rechaces por",
-      'El "tipo" que haya declarado el redactor',
-    ]
-  ) {
-    assert(
-      bloque.includes(frase),
-      `el juez debería declarar explícitamente que no juzga: "${frase}"`,
-    );
+  // Frases reales enviadas en producción (septiembre 2026) con el juez v27.
+  for (const frase of ["es perfecta para lo que describís", "excelente para"]) {
+    assert(prompt.includes(frase), `falta el ejemplo "${frase}"`);
   }
-
   assert(
-    /decisiones de REDACCIÓN/i.test(bloque),
-    "falta la frase que le saca al juez la opinión sobre redacción",
-  );
-  assert(
-    /no una recomendación\s+personalizada/i.test(bloque),
-    "falta la aclaración de que los cuidados citados no son una recomendación",
+    /describir un tratamiento como lo describe el catálogo NO es recomendar/i
+      .test(prompt),
+    "falta la distinción entre describir (ok) y recomendar (no)",
   );
 });
 
-Deno.test("el juez sigue verificando números dígito por dígito", () => {
+Deno.test("v28: la regla 2 mira el mensaje de la PACIENTE, no el tipo declarado", () => {
+  const prompt = promptJuezCompleto(CATALOGO_FALSO);
+
+  assert(/Mirá el mensaje de la PACIENTE, no el tipo declarado/i.test(prompt));
+});
+
+Deno.test("v28: el juez NO revisa datos, turnos ni links (los verifica el código)", () => {
   const prompt = promptJuezCompleto(CATALOGO_FALSO);
 
   assert(
-    /dígito por dígito/i.test(prompt),
-    "se perdió la verificación de números dígito por dígito",
+    /ya los verificó el código/i.test(prompt),
+    "el juez tiene que saber que los datos ya están verificados",
   );
-});
-
-Deno.test("el juez ve la sección de FAQ operativa autorizada", () => {
-  const prompt = promptJuezCompleto(CATALOGO_FALSO);
-
   assert(
-    prompt.includes(FAQ_OPERATIVA),
-    "el juez no ve la sección de FAQ operativa autorizada",
+    !/EVIDENCIA DE TURNOS/i.test(prompt) && !/dígito por dígito/i.test(prompt),
+    "volvió la verificación de datos/turnos al juez (causa de los falsos rechazos de v27)",
+  );
+  assert(!prompt.includes(CALENDLY_LINK), "el juez no necesita el link");
+  assert(
+    !prompt.includes(FAQ_OPERATIVA),
+    "el juez no necesita la FAQ: horarios y señas los chequea el código",
   );
 });
 
-Deno.test("v16: el juez no tiene reglas propias por tipo declarado", () => {
+Deno.test("v28: el juez ve el catálogo (regla 3) y no juzga redacción", () => {
   const prompt = promptJuezCompleto(CATALOGO_FALSO);
 
-  // Pedido de Santi 2026-08-05 (v9) y reafirmado en v16: nada de "si el tipo
-  // declarado es X, aprobás solo si...".
-  for (const tipo of TIPOS_RESPUESTA.filter((t) => t !== "silencio")) {
-    assert(
-      !prompt.includes(`Si el tipo declarado es "${tipo}"`),
-      `el juez todavía tiene una regla propia para '${tipo}' — se decidió sacarlas`,
-    );
-  }
+  assert(prompt.includes(CATALOGO_FALSO), "el juez tiene que ver el catálogo");
+  assert(/no juzgás tono, largo, completitud ni el tipo/i.test(prompt));
+  assert(
+    /sin contenido médico .* se aprueba/is.test(prompt),
+    "un borrador sin contenido médico tiene que aprobarse",
+  );
 });
 
 Deno.test("el juez pide un motivo accionable, porque lo lee el reescritor", () => {
@@ -616,8 +487,8 @@ Deno.test("el juez pide un motivo accionable, porque lo lee el reescritor", () =
     "el juez tiene que saber que su motivo alimenta la reescritura (v16)",
   );
   assert(
-    /EXACTAMENTE qué dato/i.test(prompt),
-    "falta la exigencia de señalar exactamente qué dato es el problema",
+    /citá EXACTAMENTE la frase del borrador/i.test(prompt),
+    "falta la exigencia de citar exactamente la frase que es el problema",
   );
 });
 

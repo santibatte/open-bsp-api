@@ -23,7 +23,8 @@ export type TipoHallazgo =
   | "fecha"
   | "hora"
   | "dia_sin_lugar"
-  | "dia_semana";
+  | "dia_semana"
+  | "dato_de_pago";
 
 export interface Hallazgo {
   tipo: TipoHallazgo;
@@ -261,6 +262,8 @@ interface FechaEnTexto {
   clave: string;
   diaSemana?: string;
   texto: string;
+  /** "hoy" / "mañana" / "pasado mañana": solo cuenta si va con una hora. */
+  relativa: boolean;
 }
 
 function clave(dia: number, mes: number): string {
@@ -308,6 +311,7 @@ export function extraerFechas(texto: string, ahora: Date): FechaEnTexto[] {
     mes: number,
     anio: number | undefined,
     diaSemana: string | undefined,
+    relativa = false,
   ) => {
     const inicio = m.index ?? 0;
     const fin = inicio + m[0].length;
@@ -323,6 +327,7 @@ export function extraerFechas(texto: string, ahora: Date): FechaEnTexto[] {
       clave: clave(dia, mes),
       diaSemana,
       texto: m[0],
+      relativa,
     });
   };
 
@@ -359,7 +364,7 @@ export function extraerFechas(texto: string, ahora: Date): FechaEnTexto[] {
   ) {
     const dias = m[1] === "hoy" ? 0 : m[1] === "manana" ? 1 : 2;
     const f = sumarDias(ahora, dias);
-    agregar(m, f.dia, f.mes, undefined, undefined);
+    agregar(m, f.dia, f.mes, undefined, undefined, true);
   }
 
   return fechas;
@@ -486,6 +491,50 @@ export function extraerMails(texto: string): string[] {
   return [
     ...texto.matchAll(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi),
   ].map((m) => m[0].toLowerCase().replace(/\.+$/, ""));
+}
+
+const CONECTORES_ALIAS = new Set([
+  "es",
+  "el",
+  "la",
+  "de",
+  "del",
+  "para",
+  "transferir",
+  "transferencia",
+  "sena",
+  "pago",
+  "nuestro",
+  "mi",
+  "a",
+  "al",
+]);
+
+/**
+ * "alias MELIDERMATO", "el alias es meli.dermato", "Alias para transferir la
+ * seña: MELIDERMATO" → el primer token después de "alias" que no sea un
+ * conector, en minúscula.
+ */
+export function extraerAlias(texto: string): string[] {
+  const alias: string[] = [];
+
+  for (const m of normalizar(texto).matchAll(/\balias\b([^\n]{0,60})/g)) {
+    const token = m[1]
+      .split(/[\s:,()]+/)
+      .map((t) => t.replace(/[.!?;]+$/, ""))
+      .find((t) => t && !CONECTORES_ALIAS.has(t));
+
+    if (token && /^[a-z0-9][a-z0-9.-]{2,19}$/.test(token)) alias.push(token);
+  }
+
+  return alias;
+}
+
+/** CBU/CVU: 22 dígitos, con o sin espacios/guiones entre bloques. */
+function extraerCuentas(texto: string): string[] {
+  return [...normalizar(texto).matchAll(/\b(?:\d[\s-]?){21}\d\b/g)].map((m) =>
+    m[0].replace(/\D/g, "")
+  );
 }
 
 // ─────────────────────────────── verificación ───────────────────────────────
@@ -660,7 +709,9 @@ export function verificarBorrador(
           }
         }
 
-        if (!turnos.fechasConocidas.has(fecha.clave)) {
+        // "¿En qué te puedo ayudar hoy?" no afirma nada: un "hoy"/"mañana"
+        // suelto solo importa si va con una hora (se chequea más abajo).
+        if (!fecha.relativa && !turnos.fechasConocidas.has(fecha.clave)) {
           hallazgos.push({
             tipo: "fecha",
             valor: fecha.texto,
@@ -751,6 +802,31 @@ export function verificarBorrador(
         valor: link,
         motivo:
           `El link ${link} no es ninguno de los autorizados (tiene que ser idéntico, carácter por carácter).`,
+      });
+    }
+  }
+
+  // ── Datos para transferir: un alias o CBU inventado es plata que se va a
+  // otra cuenta. Solo vale el de la FAQ, idéntico. ──
+  const aliasOk = new Set(extraerAlias(fuentes.faq));
+  const cuentasOk = new Set(extraerCuentas(fuentes.faq));
+
+  for (const alias of extraerAlias(borrador)) {
+    if (!aliasOk.has(alias)) {
+      hallazgos.push({
+        tipo: "dato_de_pago",
+        valor: alias,
+        motivo: `El alias ${alias} no es el alias autorizado para transferir.`,
+      });
+    }
+  }
+
+  for (const cuenta of extraerCuentas(borrador)) {
+    if (!cuentasOk.has(cuenta)) {
+      hallazgos.push({
+        tipo: "dato_de_pago",
+        valor: cuenta,
+        motivo: "El borrador incluye un CBU/CVU que no está autorizado.",
       });
     }
   }
