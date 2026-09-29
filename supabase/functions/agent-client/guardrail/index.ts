@@ -39,6 +39,7 @@ import type {
 } from "../../_shared/supabase.ts";
 import type { AgentRowWithExtra } from "../protocols/base.ts";
 import {
+  consultarJornadasIpl,
   crearCalendlyTools,
   resolverLinkAgendamiento,
   type ResultadoLinkAgendamiento,
@@ -78,6 +79,7 @@ import {
   systemRedactorContexto,
   systemReescrituraContexto,
   systemReescrituraEstatico,
+  textoJornadasIpl,
   type TipoRespuesta,
   userJuez,
   userRedactor,
@@ -335,6 +337,46 @@ function aplicarResolucionLink(
   }
 }
 
+const MENCIONA_IPL = /\b(ipl|nir)\b|luz pulsada/i;
+
+/** Cache por instancia de la Edge Function — evita pegarle a Calendly
+ * (~7 requests por jornada activa) en cada mensaje de la misma charla. */
+const JORNADAS_CACHE_MS = 10 * 60 * 1000;
+let jornadasCache: { texto: string; en: number } | null = null;
+
+/**
+ * Texto de las jornadas IPL/NIR con lugar si `textoConversacion` menciona
+ * IPL/NIR/luz pulsada; `undefined` si no aplica. Fail-soft: si Calendly
+ * falla, el redactor sigue sin el bloque (igual que antes de v26) — el
+ * catálogo ya le dice que no invente fechas de jornadas.
+ */
+async function jornadasIplSiCorresponde(
+  textoConversacion: string,
+): Promise<string | undefined> {
+  if (!MENCIONA_IPL.test(textoConversacion)) return undefined;
+
+  if (jornadasCache && Date.now() - jornadasCache.en < JORNADAS_CACHE_MS) {
+    return jornadasCache.texto;
+  }
+
+  const apiKey = Deno.env.get("CALENDLY_API_KEY");
+
+  if (!apiKey) return undefined;
+
+  try {
+    const texto = textoJornadasIpl(
+      await consultarJornadasIpl(apiKey, { timeoutMs: 5000 }),
+    );
+    jornadasCache = { texto, en: Date.now() };
+    return texto;
+  } catch (error) {
+    log.warn("Guardrail — no se pudieron consultar las jornadas de IPL", {
+      detalle: String(error),
+    });
+    return undefined;
+  }
+}
+
 /**
  * Texto plano de un turno de historial, para armar el `textoConversacion`
  * que usa el gate de seguridad de `turnos.ts` (heurística de "el día/hora
@@ -514,6 +556,12 @@ export async function runGuardrail(
 
   log.info("Guardrail — etapa", { etapa, sub_estado: subEstado });
 
+  // Jornadas de IPL/NIR en vivo, solo si la conversación toca el tema (ver
+  // `consultarJornadasIpl` y v26 en prompts.ts).
+  const jornadasIpl = await jornadasIplSiCorresponde(
+    `${historialComoTexto(historial)}\n${mensajePaciente}`,
+  );
+
   // ══════════════ PASO 1 — REDACTOR ══════════════
 
   const turnoActual: GuardrailTurn = {
@@ -529,7 +577,7 @@ export async function runGuardrail(
       ...llamado,
       system: [
         ...systemRedactorBloques(catalogo),
-        systemRedactorContexto(datosGuardados, etapa),
+        systemRedactorContexto(datosGuardados, etapa, jornadasIpl),
       ],
       messages: messagesRedactor,
       schema: SCHEMA_REDACTOR,
@@ -802,6 +850,12 @@ export async function runGuardrail(
   // la señal es que hay que seguir acotando al juez, no agregar otra capa
   // (ver el plan, sección 2).
 
+  // Las jornadas de IPL que vio el redactor también son evidencia (c) para
+  // el juez: si no, rechazaría las fechas que el redactor tiene permitido dar.
+  const evidenciaJuez = [evidenciaTurnos, jornadasIpl]
+    .filter(Boolean)
+    .join("\n\n");
+
   let mensajeFinal = redactor.mensaje;
   let juez: SalidaJuez;
   let yaSeReescribio = false;
@@ -812,7 +866,7 @@ export async function runGuardrail(
         ...llamado,
         system: [
           systemJuezEstatico(catalogo),
-          systemJuezContexto(evidenciaTurnos),
+          systemJuezContexto(evidenciaJuez),
         ],
         messages: [
           {
@@ -874,7 +928,7 @@ export async function runGuardrail(
         ...llamado,
         system: [
           systemReescrituraEstatico(catalogo),
-          systemReescrituraContexto(evidenciaTurnos),
+          systemReescrituraContexto(evidenciaJuez),
         ],
         messages: [
           {

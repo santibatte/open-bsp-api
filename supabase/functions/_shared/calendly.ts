@@ -457,6 +457,10 @@ function categorizarTurno(nombreEvento: string): string {
 async function resolverTipoTurno(
   tratamientoOTipo: string,
   opts: ClienteOpts,
+  /** "YYYY-MM-DD..." del día que se está consultando/agendando. Con varias
+   * jornadas de IPL activas a la vez, elige la del mes de esa fecha o, si
+   * ese mes no tiene, la siguiente — nunca pregunta "¿qué mes?". */
+  fechaReferenciaISO?: string,
 ): Promise<
   { ok: true; tipo: EventTypeActivo } | { ok: false; detalle: string }
 > {
@@ -465,7 +469,10 @@ async function resolverTipoTurno(
 
   let candidatos: EventTypeActivo[];
 
-  if (t.includes("ipl") || t.includes("nir") || t.includes("luz pulsada")) {
+  const esIpl = t.includes("ipl") || t.includes("nir") ||
+    t.includes("luz pulsada");
+
+  if (esIpl) {
     candidatos = activos.filter((e) =>
       e.nombre.toLowerCase().includes("luz pulsada")
     );
@@ -493,6 +500,19 @@ async function resolverTipoTurno(
         `No hay ningún turno activo en Calendly que matchee '${tratamientoOTipo}'. ` +
         `Turnos activos ahora: ${activos.map((e) => e.nombre).join(", ")}`,
     };
+  }
+
+  // Varias jornadas de IPL activas a la vez (Meli carga oct/nov/dic juntas):
+  // por defecto la más cercana a la fecha pedida. El redactor solo ofrece
+  // otro mes si la paciente dice que no puede (ver v26 en prompts.ts), y en
+  // ese caso la fecha que llega acá ya es de ese otro mes.
+  if (candidatos.length > 1 && esIpl) {
+    const mesReferencia = Number(
+      (fechaReferenciaISO ?? fechaLocalISO(new Date())).slice(5, 7),
+    );
+    const elegido = elegirMasProximo(candidatos, mesReferencia);
+
+    if (elegido) return { ok: true, tipo: elegido };
   }
 
   if (candidatos.length > 1) {
@@ -661,6 +681,124 @@ export async function resolverLinkAgendamiento(
     nombre: candidatos[0].nombre,
     link: candidatos[0].schedulingUrl,
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Días de jornada IPL/NIR con lugar — contexto para el redactor y evidencia
+// para el juez (bug real 2026-09-29: una paciente que no podía ir a la
+// jornada recibió "pasame el día que te venga bien y te agendo", como si IPL
+// se hiciera cualquier día). Resuelto en vivo: los event types de Luz
+// Pulsada cambian cada mes y solo tienen horarios en los días de jornada.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Ventana de búsqueda si el nombre del evento no dice de qué mes es. */
+const HORIZONTE_JORNADA_DIAS = 42;
+
+/** Calendly limita cada consulta de `/event_type_available_times` a 7 días. */
+const TRAMO_DISPONIBILIDAD_DIAS = 7;
+
+/**
+ * Ventana [desde, hasta) en ms donde buscar horarios de un evento de jornada:
+ * el mes que dice su nombre (la próxima vez que ese mes ocurra, contando el
+ * actual), o `HORIZONTE_JORNADA_DIAS` si el nombre no menciona mes. Nunca
+ * arranca antes de `ahoraMs`.
+ */
+function ventanaJornada(nombre: string, ahoraMs: number): [number, number] {
+  const mes = mesDeNombreEvento(nombre);
+
+  if (!mes) return [ahoraMs, ahoraMs + HORIZONTE_JORNADA_DIAS * 86_400_000];
+
+  const [anioActual, mesActual] = fechaLocalISO(new Date(ahoraMs))
+    .split("-").map(Number);
+  const anio = mes >= mesActual ? anioActual : anioActual + 1;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const inicioMes = +new Date(`${anio}-${pad(mes)}-01T00:00:00-03:00`);
+  const finMes = mes === 12
+    ? +new Date(`${anio + 1}-01-01T00:00:00-03:00`)
+    : +new Date(`${anio}-${pad(mes + 1)}-01T00:00:00-03:00`);
+
+  return [Math.max(inicioMes, ahoraMs), finMes];
+}
+
+export interface JornadaIpl {
+  /** Nombre del event type de Calendly (ej. "Luz Pulsada Intensa Octubre"). */
+  nombre: string;
+  /** Días con al menos un horario libre, ya formateados con día de semana
+   * ("miércoles 07/10/2026"), en orden cronológico. Vacío = sin lugar. */
+  diasConLugar: string[];
+}
+
+/**
+ * Todas las jornadas IPL/NIR activas en Calendly con los días que todavía
+ * tienen lugar dentro de `HORIZONTE_JORNADA_DIAS`. Lista vacía = no hay
+ * ningún event type de Luz Pulsada activo. Tira `CalendlyError` si falla la
+ * API: el caller decide qué hacer (en el guardrail es fail-soft).
+ */
+export async function consultarJornadasIpl(
+  apiKey: string,
+  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<JornadaIpl[]> {
+  const clienteOpts: ClienteOpts = { apiKey, ...opts };
+  const activos = await listarTiposTurnoActivos(clienteOpts);
+  const eventosIpl = activos.filter((e) =>
+    e.nombre.toLowerCase().includes(FILTRO_POR_CATEGORIA.ipl)
+  );
+
+  // Un minuto de margen: si el `start_time` queda en el pasado para cuando
+  // llega el request, Calendly devuelve 400 "start_time must be in the future".
+  const ahora = Date.now() + 60_000;
+
+  // Ordenadas por mes de jornada, así "la próxima" es siempre la primera.
+  const ordenados = eventosIpl
+    .map((evento) => ({
+      evento,
+      ventana: ventanaJornada(evento.nombre, ahora),
+    }))
+    .sort((a, b) => a.ventana[0] - b.ventana[0]);
+
+  return await Promise.all(ordenados.map(async ({ evento, ventana }) => {
+    const [desde, hasta] = ventana;
+    const tramos: [number, number][] = [];
+
+    for (
+      let t = desde;
+      t < hasta;
+      t += TRAMO_DISPONIBILIDAD_DIAS * 86_400_000
+    ) {
+      tramos.push([
+        t,
+        Math.min(t + TRAMO_DISPONIBILIDAD_DIAS * 86_400_000, hasta),
+      ]);
+    }
+
+    const porTramo = await Promise.all(
+      tramos.map(([a, b]) =>
+        calendlyGetJson<{ collection: { start_time: string }[] }>(
+          `/event_type_available_times?${new URLSearchParams({
+            event_type: evento.uri,
+            start_time: new Date(a).toISOString(),
+            end_time: new Date(b).toISOString(),
+          })}`,
+          clienteOpts,
+        )
+      ),
+    );
+
+    const dias = new Set<string>();
+
+    for (const { collection } of porTramo) {
+      for (const h of collection) {
+        dias.add(fechaLocalISO(new Date(h.start_time)));
+      }
+    }
+
+    return {
+      nombre: evento.nombre,
+      diasConLugar: [...dias].sort().map((iso) =>
+        fechaConDiaSemana(formatearFechaCalendarioDMY(iso))
+      ),
+    };
+  }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -987,7 +1125,11 @@ async function agendarTurno(
     return { agendado: false, motivo: "falta_email" };
   }
 
-  const resuelto = await resolverTipoTurno(args.tratamientoOTipoTurno, opts);
+  const resuelto = await resolverTipoTurno(
+    args.tratamientoOTipoTurno,
+    opts,
+    args.fechaHoraDeseada,
+  );
 
   if (!resuelto.ok) {
     return {
@@ -1118,7 +1260,11 @@ async function consultarDisponibilidad(
   hoyISO: string,
   opts: ClienteOpts,
 ): Promise<ResultadoDisponibilidad> {
-  const resuelto = await resolverTipoTurno(tratamientoOTipoTurno, opts);
+  const resuelto = await resolverTipoTurno(
+    tratamientoOTipoTurno,
+    opts,
+    fechaDeseada,
+  );
 
   if (!resuelto.ok) {
     return {
@@ -1245,7 +1391,11 @@ async function consultarDisponibilidadRango(
   hoyISO: string,
   opts: ClienteOpts,
 ): Promise<ResultadoDisponibilidadRango> {
-  const resuelto = await resolverTipoTurno(tratamientoOTipoTurno, opts);
+  const resuelto = await resolverTipoTurno(
+    tratamientoOTipoTurno,
+    opts,
+    fechaInicioISO,
+  );
 
   if (!resuelto.ok) {
     return {

@@ -471,8 +471,23 @@ import type { AnthropicTool, JSONSchema, SystemBlock } from "./anthropic.ts";
  *                falsos positivos en el flujo normal de agendar (
  *                `agendar_falta_mail`). 36/37 aprobados — el resto ya
  *                documentado (Incidente 8/14, sin relación con este cambio).
+ *   v26 (pendiente) — Jornadas de IPL/NIR con fechas reales. Incidente real
+ *                2026-09-29: una paciente respondió a la campaña de IPL "no
+ *                puedo esos días, avísenme la próxima" y el bot le contestó
+ *                "pasame el día que te venga bien y te agendo", como si IPL
+ *                se hiciera cualquier día. Dos causas: (1) código — el
+ *                historial descartaba los mensajes del consultorio que
+ *                abrían la ventana, o sea la campaña misma (fix en
+ *                `agent-client/index.ts`, `getRecentHistoryTurns`); (2)
+ *                prompt — el redactor no sabía que IPL/NIR solo se hace en
+ *                días de jornada ni cuáles son. Bloque nuevo en
+ *                `systemRedactorContexto` (solo si la conversación menciona
+ *                IPL/NIR/luz pulsada) con los días con lugar consultados en
+ *                vivo en Calendly (`consultarJornadasIpl`) + la regla de no
+ *                ofrecer otros días; el mismo texto va al juez como parte de
+ *                la evidencia (c), así no rechaza esas fechas.
  */
-export const PROMPT_VERSION = 25;
+export const PROMPT_VERSION = 26;
 
 /**
  * Los tipos de respuesta posibles. El orden es el mismo que el CHECK de
@@ -1082,9 +1097,12 @@ podés decir. Ante cualquier conflicto: bloque 1 > bloque 3 > bloque 2.`,
 export function systemRedactorContexto(
   datosGuardados: DatosContactoGuardados,
   etapa: EtapaConversacion,
+  jornadasIpl?: string,
 ): SystemBlock {
   return {
-    text: `════════════════════════════════════════
+    text: `${
+      jornadasIpl ? bloqueJornadasIplRedactor(jornadasIpl) : ""
+    }════════════════════════════════════════
 ETAPA DE LA CONVERSACIÓN: ${etapa}
 ════════════════════════════════════════
 Este dato ya está resuelto por un paso anterior — es SOLO LECTURA. No lo
@@ -1105,6 +1123,47 @@ vuelvas a pedir de cero: mostraselo y pedile que confirme o corrija. Ejemplo:
     } — ¿lo uso o me pasás otro?". Si no hay nada guardado, pedíselo con
 naturalidad, como la primera vez.`,
   };
+}
+
+/**
+ * Texto de las jornadas IPL/NIR consultadas en vivo — el MISMO string va al
+ * redactor (con las reglas de abajo) y al juez (como evidencia (c)), así lo
+ * que el redactor puede afirmar y lo que el juez acepta nunca se desincronizan.
+ */
+export function textoJornadasIpl(
+  jornadas: { nombre: string; diasConLugar: string[] }[],
+): string {
+  if (!jornadas.length) {
+    return "JORNADAS DE IPL/NIR (consultado en vivo en Calendly): no hay ninguna jornada de IPL/NIR cargada por ahora.";
+  }
+
+  const lineas = jornadas.map((j) =>
+    j.diasConLugar.length
+      ? `- ${j.nombre}: días con lugar → ${j.diasConLugar.join(", ")}`
+      : `- ${j.nombre}: ya no tiene lugar en ningún día.`
+  );
+
+  return `JORNADAS DE IPL/NIR (consultado en vivo en Calendly):
+${lineas.join("\n")}`;
+}
+
+function bloqueJornadasIplRedactor(jornadasIpl: string): string {
+  return `════════════════════════════════════════
+JORNADAS DE LUZ PULSADA (IPL/NIR) — dato real, solo lectura
+════════════════════════════════════════
+${jornadasIpl}
+
+IPL/NIR NO se hace cualquier día: SOLO en los días de jornada de arriba
+(la primera de la lista es la más próxima).
+- Si la paciente está respondiendo a un mensaje del consultorio sobre la
+  jornada de IPL, entendé que habla de eso aunque no lo nombre.
+- Nunca le pidas "el día que te quede bien" para IPL/NIR ni le ofrezcas otros
+  días para hacerlo.
+- Si no puede en esa jornada, contale cuál es la siguiente de la lista (si
+  hay). Si no hay otra, decile que le vamos a avisar cuando se abra la
+  próxima. Nunca menciones una fecha de jornada que no esté arriba.
+
+`;
 }
 
 /** Envuelve el mensaje actual (o un turno histórico de la paciente) contra
