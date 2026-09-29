@@ -1075,7 +1075,7 @@ Deno.test("agendar_turno SOLO se expone en lista_para_agendar", () => {
 });
 
 Deno.test("leerSubEstado: ausente o basura cae en el primer escalón", () => {
-  const fake = (extra: unknown) => ({ id: "c1", extra } as never);
+  const fake = (extra: unknown) => extra as never;
 
   assertEquals(leerSubEstado(undefined), "recolectando_horario");
   assertEquals(leerSubEstado(fake(null)), "recolectando_horario");

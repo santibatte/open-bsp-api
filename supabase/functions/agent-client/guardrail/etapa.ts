@@ -22,7 +22,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import * as log from "../../_shared/logger.ts";
-import type { ContactRow } from "../../_shared/supabase.ts";
+import { guardarEnMemoria, type MemoriaPaciente } from "./memoria.ts";
 import {
   agregarTurnoFinal,
   callStructured,
@@ -40,9 +40,11 @@ import {
   userEtapa,
 } from "./prompts.ts";
 
-/** Lee la etapa guardada en `contacts.extra.etapa`. Ausente/rara = inicial. */
-export function leerEtapa(contact?: ContactRow): EtapaConversacion {
-  const extra = contact?.extra as Record<string, unknown> | null | undefined;
+/** Lee la etapa guardada en la memoria de la paciente (`extra.etapa`, ver
+ * `memoria.ts`). Ausente/rara = inicial. */
+export function leerEtapa(
+  extra?: Record<string, unknown> | null,
+): EtapaConversacion {
   const raw = extra?.etapa;
 
   return typeof raw === "string" && (ETAPAS as readonly string[]).includes(raw)
@@ -51,26 +53,16 @@ export function leerEtapa(contact?: ContactRow): EtapaConversacion {
 }
 
 /**
- * Persiste la etapa en `contacts.extra`, reusando el mismo RPC de merge que
- * `email`/`nombre_completo` (`merge_contact_datos_contacto`) — no hace falta
- * una función SQL nueva: mergea el patch sin pisar las otras claves.
- * Best effort: si falla, se loguea y se sigue.
+ * Persiste la etapa en la memoria de la paciente (`memoria.ts`: contacto si
+ * existe, si no la fila de su teléfono). Best effort: si falla, se loguea y
+ * se sigue.
  */
 export async function guardarEtapa(
   client: SupabaseClient,
-  contact: ContactRow | undefined,
+  memoria: MemoriaPaciente | undefined,
   etapa: EtapaConversacion,
 ): Promise<void> {
-  if (!contact?.id) return;
-
-  const { error } = await client.rpc("merge_contact_datos_contacto", {
-    _contact_id: contact.id,
-    _datos: { etapa },
-  });
-
-  if (error) {
-    log.error("Guardrail — no se pudo guardar la etapa (se ignora)", error);
-  }
+  await guardarEnMemoria(client, memoria, { etapa }, "etapa");
 }
 
 export interface ClasificarEtapaParams {

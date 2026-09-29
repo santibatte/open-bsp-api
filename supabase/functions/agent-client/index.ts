@@ -948,6 +948,7 @@ Deno.serve(async (req) => {
         client,
         conversation: conv,
         contact,
+        contactAddress: contact_address,
         agent,
         tipoMensaje,
         mensajePaciente,

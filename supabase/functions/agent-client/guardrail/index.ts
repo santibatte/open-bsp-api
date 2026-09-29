@@ -33,6 +33,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import * as log from "../../_shared/logger.ts";
 import type {
+  ContactAddressRow,
   ContactRow,
   ConversationRow,
   MessageInsert,
@@ -92,7 +93,13 @@ import {
   ejecutarPasoTurnos,
   guardarSubEstado,
   leerSubEstado,
+  leerTurnoConsultado,
 } from "./turnos.ts";
+import {
+  crearMemoriaPaciente,
+  guardarEnMemoria,
+  type MemoriaPaciente,
+} from "./memoria.ts";
 import { clasificarEtapa, guardarEtapa, leerEtapa } from "./etapa.ts";
 import { hookCosto } from "./costos.ts";
 
@@ -100,6 +107,9 @@ export interface GuardrailParams {
   client: SupabaseClient;
   conversation: ConversationRow;
   contact?: ContactRow;
+  /** Fila del teléfono de la conversación — donde vive la memoria de la
+   * paciente cuando todavía no tiene contacto (ver `memoria.ts`). */
+  contactAddress?: ContactAddressRow | null;
   agent: AgentRowWithExtra;
   /**
    * Tipo del contenido entrante ("text", "file", ...). Cuando no es "text" se
@@ -128,14 +138,13 @@ export interface GuardrailResult {
 }
 
 /**
- * Lee los datos de contacto ya guardados (memoria de largo plazo). Mismo
- * campo `contacts.extra` que `etapa` y `agendamiento_estado`, claves `email`
- * y `nombre_completo`. Ausentes o vacíos = null (no "" — evita mostrarle al
- * redactor un dato guardado en blanco).
+ * Lee los datos de contacto ya guardados (memoria de largo plazo, ver
+ * `memoria.ts`), claves `email` y `nombre_completo`. Ausentes o vacíos =
+ * null (no "" — evita mostrarle al redactor un dato guardado en blanco).
  */
-function leerDatosContacto(contact?: ContactRow): DatosContactoGuardados {
-  const extra = contact?.extra as Record<string, unknown> | null | undefined;
-
+function leerDatosContacto(
+  extra: Record<string, unknown> | null | undefined,
+): DatosContactoGuardados {
   const email = typeof extra?.email === "string" && extra.email.trim()
     ? extra.email.trim()
     : null;
@@ -152,66 +161,54 @@ function leerDatosContacto(contact?: ContactRow): DatosContactoGuardados {
 
 /**
  * Persiste que ya se le avisó a la paciente sobre un turno existente antes
- * de agendar otro (Fix 3, 2026-08-09). Mismo RPC/patrón best-effort que
- * `guardarDatosContacto`/`guardarSubEstado`.
+ * de agendar otro (Fix 3, 2026-08-09). Best effort, como todo lo de
+ * `memoria.ts`.
  */
 async function guardarTurnoAdicionalAvisado(
   client: SupabaseClient,
-  contact: ContactRow | undefined,
+  memoria: MemoriaPaciente,
 ): Promise<void> {
-  if (!contact?.id) return;
-
-  const { error } = await client.rpc("merge_contact_datos_contacto", {
-    _contact_id: contact.id,
-    _datos: { turno_adicional_avisado: true },
-  });
-
-  if (error) {
-    log.error(
-      "Falló merge_contact_datos_contacto (turno_adicional_avisado)",
-      error,
-    );
-  }
+  await guardarEnMemoria(
+    client,
+    memoria,
+    { turno_adicional_avisado: true },
+    "turno_adicional_avisado",
+  );
 }
 
 /**
- * Resetea el aviso de "turno adicional" junto con el sub-estado, cada vez
- * que arranca un ciclo de agendamiento nuevo — si no, una paciente que ya
- * fue avisada una vez en un ciclo viejo no recibiría el aviso en una
- * situación de turno duplicado distinta más adelante.
+ * Reinicia lo que es propio de UN ciclo de agendamiento cada vez que arranca
+ * uno nuevo (o se cerró el anterior): el aviso de "turno adicional" — si no,
+ * una paciente ya avisada en un ciclo viejo no recibiría el aviso en otra
+ * situación de turno duplicado más adelante — y el último turno consultado
+ * — si no, un agendar del ciclo nuevo podría tomar el día de uno viejo.
  */
-async function resetearTurnoAdicionalAvisado(
+async function resetearCicloAgendamiento(
   client: SupabaseClient,
-  contact: ContactRow | undefined,
+  memoria: MemoriaPaciente,
 ): Promise<void> {
-  if (!contact?.id) return;
+  const patch: Record<string, unknown> = {};
 
-  const { error } = await client.rpc("merge_contact_datos_contacto", {
-    _contact_id: contact.id,
-    _datos: { turno_adicional_avisado: false },
-  });
-
-  if (error) {
-    log.error(
-      "Falló merge_contact_datos_contacto (reset turno_adicional_avisado)",
-      error,
-    );
+  if (memoria.extra.turno_adicional_avisado === true) {
+    patch.turno_adicional_avisado = false;
   }
+
+  if (memoria.extra.turno_consultado) patch.turno_consultado = null;
+
+  await guardarEnMemoria(client, memoria, patch, "reset ciclo agendamiento");
 }
 
 /**
  * Persiste los datos que el redactor (o el paso de turnos) detectó en el
- * mensaje (memoria de largo plazo), vía RPC atómico (ver
- * `merge_contact_datos_contacto()` en `agent_guardrails.sql`) — el mismo RPC
- * que usan `guardarEtapa()` y `guardarSubEstado()`. No hace nada si no se
- * detectó ningún dato nuevo en este mensaje puntual.
+ * mensaje (memoria de largo plazo). No hace nada si no se detectó ningún
+ * dato nuevo en este mensaje puntual.
  */
 async function guardarDatosContacto(
   client: SupabaseClient,
-  contact: ContactRow | undefined,
+  memoria: MemoriaPaciente,
   datos: { email: string | null; nombre_completo: string | null } | undefined,
 ): Promise<void> {
-  if (!contact?.id || !datos) return;
+  if (!datos) return;
 
   const patch: Record<string, string> = {};
 
@@ -225,16 +222,7 @@ async function guardarDatosContacto(
     patch.nombre_completo = datos.nombre_completo.trim();
   }
 
-  if (!Object.keys(patch).length) return;
-
-  const { error } = await client.rpc("merge_contact_datos_contacto", {
-    _contact_id: contact.id,
-    _datos: patch,
-  });
-
-  if (error) {
-    log.error("Falló merge_contact_datos_contacto", error);
-  }
+  await guardarEnMemoria(client, memoria, patch, "datos de contacto");
 }
 
 /**
@@ -400,6 +388,7 @@ export async function runGuardrail(
     client,
     conversation,
     contact,
+    contactAddress,
     agent,
     tipoMensaje,
     mensajePaciente,
@@ -408,9 +397,10 @@ export async function runGuardrail(
     headers,
   } = params;
 
-  const datosGuardados = leerDatosContacto(contact);
-  const etapaGuardada = leerEtapa(contact);
-  const subEstadoGuardado = leerSubEstado(contact);
+  const memoria = crearMemoriaPaciente(contact, contactAddress);
+  const datosGuardados = leerDatosContacto(memoria.extra);
+  const etapaGuardada = leerEtapa(memoria.extra);
+  const subEstadoGuardado = leerSubEstado(memoria.extra);
   const historial = historialTurnos ?? [];
 
   // ── Portón 0: falta la config que se edita a mano ──
@@ -531,7 +521,7 @@ export async function runGuardrail(
   });
 
   if (etapa !== etapaGuardada) {
-    await guardarEtapa(client, contact, etapa);
+    await guardarEtapa(client, memoria, etapa);
   }
 
   // El sub-estado del agendamiento solo vive DENTRO del flujo de turnos: si
@@ -545,12 +535,10 @@ export async function runGuardrail(
       : SUB_ESTADO_INICIAL;
 
   if (subEstado !== subEstadoGuardado) {
-    await guardarSubEstado(client, contact, subEstado);
+    await guardarSubEstado(client, memoria, subEstado);
 
-    if (
-      subEstado === SUB_ESTADO_INICIAL && datosGuardados.turnoAdicionalAvisado
-    ) {
-      await resetearTurnoAdicionalAvisado(client, contact);
+    if (subEstado === SUB_ESTADO_INICIAL) {
+      await resetearCicloAgendamiento(client, memoria);
     }
   }
 
@@ -620,7 +608,7 @@ export async function runGuardrail(
   // Memoria de largo plazo: si la paciente escribió su mail o su nombre en
   // este mensaje, guardarlo — independiente de si el juez termina aprobando
   // la respuesta o no.
-  await guardarDatosContacto(client, contact, redactor.datos_detectados);
+  await guardarDatosContacto(client, memoria, redactor.datos_detectados);
 
   // ── Camino SILENCIO: no hay juez, no hay nada que aprobar ──
   //
@@ -773,7 +761,8 @@ export async function runGuardrail(
       tools: calendlyTools,
       client,
       conversation,
-      contact,
+      memoria,
+      turnoConsultado: leerTurnoConsultado(memoria.extra, new Date()),
       incomingMessageId,
     });
 
@@ -797,17 +786,28 @@ export async function runGuardrail(
       };
     }
 
-    await guardarDatosContacto(client, contact, pasoTurnos.datosDetectados);
+    await guardarDatosContacto(client, memoria, pasoTurnos.datosDetectados);
 
     if (pasoTurnos.turnoAdicionalAvisado) {
-      await guardarTurnoAdicionalAvisado(client, contact);
+      await guardarTurnoAdicionalAvisado(client, memoria);
     }
 
     // El sub-estado nuevo ya viene validado por `proximoSubEstado()` (no se
     // salta escalones, no llega a `lista_para_agendar` sin mail y nombre, y
     // solo el código puede ponerlo en `agendado`).
     if (pasoTurnos.subEstadoNuevo !== subEstado) {
-      await guardarSubEstado(client, contact, pasoTurnos.subEstadoNuevo);
+      await guardarSubEstado(client, memoria, pasoTurnos.subEstadoNuevo);
+
+      // Ya agendado: el turno consultado quedó usado — que no lo tome un
+      // agendar posterior sin una consulta nueva.
+      if (pasoTurnos.subEstadoNuevo === "agendado") {
+        await guardarEnMemoria(
+          client,
+          memoria,
+          { turno_consultado: null },
+          "turno_consultado usado",
+        );
+      }
       log.info("Guardrail — sub-estado de agendamiento", {
         de: subEstado,
         a: pasoTurnos.subEstadoNuevo,

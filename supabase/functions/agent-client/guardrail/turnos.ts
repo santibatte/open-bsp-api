@@ -21,7 +21,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import * as log from "../../_shared/logger.ts";
-import type { ContactRow, ConversationRow } from "../../_shared/supabase.ts";
+import type { ConversationRow } from "../../_shared/supabase.ts";
 import type {
   AgendarArgs,
   CalendlyTools,
@@ -56,6 +56,7 @@ import {
   type GuardrailTurn,
   type InfoLlamado,
 } from "./anthropic.ts";
+import { guardarEnMemoria, type MemoriaPaciente } from "./memoria.ts";
 import {
   contextoAgenteTurnos,
   type DatosContactoGuardados,
@@ -197,11 +198,11 @@ export function toolsParaSubEstado(
     : [TOOL_CONSULTAR_DISPONIBILIDAD];
 }
 
-/** Lee el sub-estado guardado en `contacts.extra.agendamiento_estado`. */
+/** Lee el sub-estado guardado en la memoria de la paciente
+ * (`extra.agendamiento_estado`, ver `memoria.ts`). */
 export function leerSubEstado(
-  contact?: ContactRow,
+  extra?: Record<string, unknown> | null,
 ): SubEstadoAgendamiento {
-  const extra = contact?.extra as Record<string, unknown> | null | undefined;
   const raw = extra?.agendamiento_estado;
 
   return typeof raw === "string" &&
@@ -211,29 +212,174 @@ export function leerSubEstado(
 }
 
 /**
- * Persiste el sub-estado en `contacts.extra`, con el mismo RPC de merge que
- * `email`/`nombre_completo`/`etapa`. Best effort: si falla se loguea y se
- * sigue (el peor caso es repetir un escalón, nunca saltearse uno — el gate
- * de tools se recalcula desde el valor guardado en el próximo mensaje).
+ * Persiste el sub-estado en la memoria de la paciente. Best effort: si falla
+ * se loguea y se sigue (el peor caso es repetir un escalón, nunca saltearse
+ * uno — el gate de tools se recalcula desde el valor guardado en el próximo
+ * mensaje).
  */
 export async function guardarSubEstado(
   client: SupabaseClient,
-  contact: ContactRow | undefined,
+  memoria: MemoriaPaciente | undefined,
   subEstado: SubEstadoAgendamiento,
 ): Promise<void> {
-  if (!contact?.id) return;
+  await guardarEnMemoria(
+    client,
+    memoria,
+    { agendamiento_estado: subEstado },
+    "sub-estado",
+  );
+}
 
-  const { error } = await client.rpc("merge_contact_datos_contacto", {
-    _contact_id: contact.id,
-    _datos: { agendamiento_estado: subEstado },
-  });
+/**
+ * ══════════════════════════════════════════════════════════════════════
+ * TURNO CONSULTADO (2026-09-29)
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ * Bug real (Laura Ragucci, 2026-09-29): la paciente eligió "8 de octubre,
+ * 12:00" de una lista REAL de `consultar_disponibilidad` de IPL, dio el mail
+ * tres mensajes después, y el modelo llamó a `agendar_turno` con
+ * `fecha: {tipo: "hoy"}` y `tratamiento: "consulta general"` — reconstruyó
+ * día y tratamiento leyendo el historial, y los reconstruyó mal. El gate lo
+ * frenó (fecha en el pasado), pero con otra fecha válida habría agendado
+ * una consulta en vez de IPL.
+ *
+ * Fix: el resultado real de la última `consultar_disponibilidad` se guarda
+ * en la memoria (`extra.turno_consultado`) y, al agendar, el DÍA y el
+ * TRATAMIENTO salen de ahí — nunca de lo que el modelo reconstruya. Del
+ * modelo solo se toma la hora (que tiene que estar entre los horarios
+ * libres consultados) y, si esa hora aparece en más de un día consultado,
+ * su fecha para desempatar. Mismo principio que el resto del guardrail: el
+ * modelo propone, el código decide con datos reales.
+ */
+export interface TurnoConsultado {
+  /** Texto con el que `consultar_disponibilidad` resolvió un tipo de turno
+   * real de Calendly — se le pasa igual a `agendar_turno`. */
+  tratamiento: string;
+  /** Días con horarios libres reales (fecha "YYYY-MM-DD", horas "HH:MM"). */
+  opciones: { fecha: string; horarios: string[] }[];
+  /** ISO — para descartar consultas viejas. */
+  consultado_en: string;
+}
 
-  if (error) {
-    log.error(
-      "Paso de turnos — no se pudo guardar el sub-estado (se ignora)",
-      error,
-    );
+/** Más de esto y la consulta ya no se usa (los horarios pudieron cambiar
+ * y la conversación seguramente ya es otra). */
+const VIGENCIA_TURNO_CONSULTADO_MS = 3 * 24 * 60 * 60 * 1000;
+
+function dmyAISO(fechaDMY: string): string {
+  const [dia, mes, anio] = fechaDMY.split("/");
+  return `${anio}-${mes}-${dia}`;
+}
+
+/** Arma el `TurnoConsultado` a partir del resultado real de Calendly.
+ * `null` si no hay nada que guardar (tipo de turno ambiguo). Una consulta
+ * sin lugar se guarda con `opciones: []` a propósito: la consulta vigente
+ * pasa a ser esa, y un agendar posterior sin volver a consultar se bloquea. */
+export function turnoConsultadoDe(
+  resultado: ResultadoDisponibilidad | ResultadoDisponibilidadRango,
+  ahora: Date,
+): TurnoConsultado | null {
+  if (!resultado.disponible && resultado.motivo === "tipo_turno_ambiguo") {
+    return null;
   }
+
+  let opciones: OpcionDisponible[];
+
+  if (resultado.disponible) {
+    opciones = "opciones" in resultado
+      ? resultado.opciones
+      : [{ fecha: resultado.fecha, horarios: resultado.horarios }];
+  } else {
+    opciones = [resultado.alternativaAntes, resultado.alternativaDespues]
+      .filter((o): o is OpcionDisponible => !!o);
+  }
+
+  return {
+    tratamiento: resultado.tratamientoSolicitado,
+    opciones: opciones.map((o) => ({
+      fecha: dmyAISO(o.fecha),
+      horarios: [...o.horarios],
+    })),
+    consultado_en: ahora.toISOString(),
+  };
+}
+
+/** Lee `extra.turno_consultado`; `null` si no hay, está mal formado o es
+ * más viejo que `VIGENCIA_TURNO_CONSULTADO_MS`. */
+export function leerTurnoConsultado(
+  extra: Record<string, unknown> | null | undefined,
+  ahora: Date,
+): TurnoConsultado | null {
+  const raw = extra?.turno_consultado as Partial<TurnoConsultado> | null;
+
+  if (
+    !raw || typeof raw.tratamiento !== "string" || !raw.tratamiento.trim() ||
+    !Array.isArray(raw.opciones) || typeof raw.consultado_en !== "string"
+  ) {
+    return null;
+  }
+
+  const edad = ahora.getTime() - new Date(raw.consultado_en).getTime();
+
+  if (!(edad >= 0 && edad <= VIGENCIA_TURNO_CONSULTADO_MS)) return null;
+
+  const opciones = raw.opciones.filter((o) =>
+    typeof o?.fecha === "string" && Array.isArray(o.horarios)
+  );
+
+  return {
+    tratamiento: raw.tratamiento,
+    opciones,
+    consultado_en: raw.consultado_en,
+  };
+}
+
+/**
+ * Día y tratamiento con los que se agenda, a partir de la última consulta
+ * real. La hora del modelo tiene que estar entre los horarios libres
+ * consultados; si está en un solo día, ese es el día (ignora la fecha del
+ * modelo); si está en varios, desempata la fecha del modelo y, si no
+ * coincide con ninguno, se bloquea en vez de elegir.
+ */
+export function resolverTurnoDesdeConsulta(
+  consultado: TurnoConsultado,
+  hora: string,
+  fechaModeloISO: string | null,
+): { ok: true; fechaISO: string; tratamiento: string } | {
+  ok: false;
+  motivo: string;
+} {
+  const candidatas = consultado.opciones.filter((o) =>
+    o.horarios.includes(hora)
+  );
+
+  if (!candidatas.length) {
+    return {
+      ok: false,
+      motivo:
+        `la hora ${hora} no está entre los horarios libres de la última consulta de disponibilidad (${
+          JSON.stringify(consultado.opciones)
+        })`,
+    };
+  }
+
+  const elegida = candidatas.length === 1
+    ? candidatas[0]
+    : candidatas.find((o) => o.fecha === fechaModeloISO);
+
+  if (!elegida) {
+    return {
+      ok: false,
+      motivo: `la hora ${hora} está libre en varios días consultados (${
+        candidatas.map((o) => o.fecha).join(", ")
+      }) y la fecha del modelo (${fechaModeloISO}) no coincide con ninguno`,
+    };
+  }
+
+  return {
+    ok: true,
+    fechaISO: elegida.fecha,
+    tratamiento: consultado.tratamiento,
+  };
 }
 
 const ORDEN_SUB_ESTADOS: readonly SubEstadoAgendamiento[] =
@@ -336,7 +482,13 @@ export interface PasoTurnosParams {
   tools: CalendlyTools;
   client: SupabaseClient;
   conversation: ConversationRow;
-  contact?: ContactRow;
+  /** Dónde persistir `turno_consultado` (ver `memoria.ts`). Sin memoria
+   * (golden set) no se persiste nada. */
+  memoria?: MemoriaPaciente;
+  /** Última `consultar_disponibilidad` real todavía vigente (ver
+   * `leerTurnoConsultado`). Si está, `agendar_turno` toma día y tratamiento
+   * de acá, no del modelo. */
+  turnoConsultado?: TurnoConsultado | null;
   incomingMessageId: string;
   /** Ancla de "ahora" para resolver fechas — opcional, para poder fijarla
    * en tests (golden set) y que la resolución sea determinística. Por
@@ -583,22 +735,16 @@ function evidenciaDiaEncontrada(
  * que falle → NO se ejecuta, se registra como `bloqueado` en
  * `turno_acciones`, fail-closed.
  */
-function validarGateAgendar(
+export function validarGateAgendar(
   args: Record<string, unknown>,
   textoConversacion: string,
   ahora: Date,
-): { ok: true; fechaHoraDeseada: string } | { ok: false; motivo: string } {
+  turnoConsultado: TurnoConsultado | null = null,
+): { ok: true; fechaHoraDeseada: string; tratamiento: string } | {
+  ok: false;
+  motivo: string;
+} {
   const expr = args.fecha as ExpresionFecha | undefined;
-
-  if (!expr || typeof expr.tipo !== "string") {
-    return { ok: false, motivo: "falta 'fecha' en los argumentos de la tool" };
-  }
-
-  const resuelta = resolverFechaExpresion(expr, ahora);
-
-  if (!resuelta.ok) {
-    return { ok: false, motivo: `fecha no resuelta: ${resuelta.motivo}` };
-  }
 
   const hora = typeof args.hora === "string" ? args.hora : "";
 
@@ -611,7 +757,45 @@ function validarGateAgendar(
     };
   }
 
-  const fechaHoraDeseada = `${resuelta.fechaISO}T${hora}:00-03:00`;
+  const resuelta = expr && typeof expr.tipo === "string"
+    ? resolverFechaExpresion(expr, ahora)
+    : null;
+
+  let fechaISO: string;
+  let tratamiento: string;
+
+  if (turnoConsultado) {
+    // Día y tratamiento de la consulta REAL, no del modelo (ver
+    // "TURNO CONSULTADO" más arriba).
+    const desdeConsulta = resolverTurnoDesdeConsulta(
+      turnoConsultado,
+      hora,
+      resuelta?.ok ? resuelta.fechaISO : null,
+    );
+
+    if (!desdeConsulta.ok) return desdeConsulta;
+
+    fechaISO = desdeConsulta.fechaISO;
+    tratamiento = desdeConsulta.tratamiento;
+  } else {
+    if (!resuelta) {
+      return {
+        ok: false,
+        motivo: "falta 'fecha' en los argumentos de la tool",
+      };
+    }
+
+    if (!resuelta.ok) {
+      return { ok: false, motivo: `fecha no resuelta: ${resuelta.motivo}` };
+    }
+
+    fechaISO = resuelta.fechaISO;
+    tratamiento = typeof args.tratamiento_o_tipo_turno === "string"
+      ? args.tratamiento_o_tipo_turno.trim()
+      : "";
+  }
+
+  const fechaHoraDeseada = `${fechaISO}T${hora}:00-03:00`;
   const fecha = new Date(fechaHoraDeseada);
 
   if (fecha.getTime() <= ahora.getTime()) {
@@ -636,10 +820,6 @@ function validarGateAgendar(
     };
   }
 
-  const tratamiento = typeof args.tratamiento_o_tipo_turno === "string"
-    ? args.tratamiento_o_tipo_turno.trim()
-    : "";
-
   if (!tratamiento) {
     return {
       ok: false,
@@ -654,7 +834,9 @@ function validarGateAgendar(
   const textoNormalizado = normalizarTexto(textoConversacion);
   const horaNum = String(Number(hora.slice(0, 2)));
 
-  if (!evidenciaDiaEncontrada(expr, textoNormalizado)) {
+  // Con `turnoConsultado` el día sale de Calendly, no del modelo — no hay
+  // fecha inventada que buscar en el texto.
+  if (!turnoConsultado && !evidenciaDiaEncontrada(expr!, textoNormalizado)) {
     return {
       ok: false,
       motivo: `no se encontró evidencia del día (${
@@ -674,7 +856,7 @@ function validarGateAgendar(
     };
   }
 
-  return { ok: true, fechaHoraDeseada };
+  return { ok: true, fechaHoraDeseada, tratamiento };
 }
 
 async function registrarIntento(
@@ -779,7 +961,12 @@ async function ejecutarToolAgendar(
   const args = (toolInput ?? {}) as Record<string, unknown>;
   const textoConversacion = `${historialTexto}\n${mensajePaciente}`;
 
-  const gate = validarGateAgendar(args, textoConversacion, ahora);
+  const gate = validarGateAgendar(
+    args,
+    textoConversacion,
+    ahora,
+    params.turnoConsultado ?? null,
+  );
 
   if (!gate.ok) {
     log.warn("Paso de turnos — agendar_turno bloqueado por gate de seguridad", {
@@ -800,8 +987,24 @@ async function ejecutarToolAgendar(
     };
   }
 
+  if (params.turnoConsultado) {
+    log.info(
+      "Paso de turnos — agendar_turno: día y tratamiento tomados de la última consulta real (no del modelo)",
+      {
+        modelo: {
+          fecha: args.fecha,
+          tratamiento: args.tratamiento_o_tipo_turno,
+        },
+        usado: {
+          fechaHora: gate.fechaHoraDeseada,
+          tratamiento: gate.tratamiento,
+        },
+      },
+    );
+  }
+
   const agendarArgs: AgendarArgs = {
-    tratamientoOTipoTurno: String(args.tratamiento_o_tipo_turno ?? ""),
+    tratamientoOTipoTurno: gate.tratamiento,
     fechaHoraDeseada: gate.fechaHoraDeseada,
     nombre: String(args.nombre ?? ""),
     // NUNCA del modelo — el teléfono real de la conversación, siempre.
@@ -980,6 +1183,17 @@ async function ejecutarToolConsultarDisponibilidad(
     }
 
     evidencia = formatearEvidenciaDisponibilidad(resultado);
+  }
+
+  const turnoConsultado = turnoConsultadoDe(resultado, ahora);
+
+  if (turnoConsultado) {
+    await guardarEnMemoria(
+      params.client,
+      params.memoria,
+      { turno_consultado: turnoConsultado },
+      "turno_consultado",
+    );
   }
 
   messages.push({
