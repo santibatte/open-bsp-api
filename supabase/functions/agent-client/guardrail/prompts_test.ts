@@ -297,8 +297,12 @@ Deno.test("agendar es SOLO el pedido genérico sin fecha, y deriva a gestion_tur
   const bloque = prompt.slice(inicio, fin);
 
   assert(
-    /No\s+gasta el saludo de cortesía ni toca el contador/i.test(bloque),
-    "agendar tiene que ser on-topic y no tocar el contador",
+    /Esto NO es fuera de tema/i.test(bloque),
+    "agendar tiene que declararse on-topic",
+  );
+  assert(
+    !/contador/i.test(bloque),
+    "el contador se eliminó en v16: el prompt no puede volver a nombrarlo (v27)",
   );
   assert(
     /NUNCA inventes\s+fechas, cupos o "jornadas especiales"/i.test(bloque),
@@ -370,8 +374,8 @@ Deno.test("v16: saludo_generico absorbe todo fuera de tema, sin contador ni esca
     "falta la regla de que SIEMPRE es el mismo tipo, sin importar la repetición",
   );
   assert(
-    /no hay ningún contador/i.test(bloque),
-    "falta la aclaración explícita de que el contador no existe más",
+    !/contador/i.test(prompt),
+    "el contador se eliminó en v16: el prompt no puede volver a nombrarlo (v27)",
   );
   assert(
     /NO vuelvas a arrancar con/i.test(bloque),
@@ -1000,17 +1004,23 @@ Deno.test("los tres bloques del redactor declaran su precedencia", () => {
   const tono = systemRedactorTono().text;
   const salida = systemRedactorSalida().text;
 
+  // v27: la precedencia se declara UNA vez, en seguridad (antes estaba
+  // repetida en los tres bloques).
   assert(
-    /gana el bloque 1, siempre/i.test(seguridad),
+    /gana el bloque 1,\s+siempre/i.test(seguridad),
     "el bloque de seguridad tiene que declararse ganador ante cualquier conflicto",
   );
   assert(
-    /gana el bloque 1/i.test(tono),
+    /bloque 1 > bloque 3 > bloque 2/.test(seguridad),
+    "falta el orden de precedencia explícito en el bloque de seguridad",
+  );
+  assert(
+    /nunca qué podés decir/i.test(tono),
     "el bloque de tono tiene que reconocer que no puede ampliar lo decible",
   );
   assert(
-    /bloque 1 > bloque 3 > bloque 2/.test(salida),
-    "falta el orden de precedencia explícito en el bloque de salida",
+    !/bloque 1 > bloque 3 > bloque 2/.test(salida),
+    "la precedencia no se repite en el bloque de salida (v27)",
   );
 
   // El catálogo vive en SEGURIDAD, no en tono: es el límite de lo decible.
@@ -1032,8 +1042,8 @@ Deno.test("el redactor trata el mensaje de la paciente como datos, nunca como ó
     "falta el ejemplo concreto de intento de injection",
   );
   assert(
-    /se\s+trata como fuera de tema/i.test(seguridad),
-    "falta qué hacer con un intento de injection (contestarlo como fuera de tema)",
+    /fuera de tema \(tipo "saludo_generico"\)/i.test(seguridad),
+    "falta qué hacer con un intento de injection (contestarlo como saludo_generico)",
   );
 });
 
@@ -1296,4 +1306,63 @@ Deno.test("estimarCosto devuelve null (no cero) para un modelo sin tarifa", () =
     }),
     null,
   );
+});
+
+// ════════════════════ v27 — sin contradicciones sobre agendar_turno ════════════════════
+//
+// Hasta v26 la regla 3 del agente de turnos ordenaba llamar a
+// "agendar_turno" apenas hubiera día+hora+mail+nombre, aunque el código solo
+// expone esa tool en `lista_para_agendar`, y la descripción de la tool pedía
+// "CONFIRMÁ con la paciente" mientras el prompt decía "no preguntes
+// ¿confirmo?". Estos tests fijan la versión coherente con el gating.
+
+Deno.test("v27: el agente de turnos solo agenda en lista_para_agendar, directo y sin reconsultar", () => {
+  const prompt = systemAgenteTurnosEstatico(CATALOGO_FALSO).text;
+
+  assert(
+    /solo en el escalón "lista_para_agendar"/i.test(prompt),
+    "la regla de agendar tiene que atarse al único escalón donde existe la tool",
+  );
+  assert(
+    /no vuelvas a consultar disponibilidad/i.test(prompt),
+    "en lista_para_agendar tiene que agendar directo, sin gastar la única tool en consultar",
+  );
+  assert(
+    !/LLAMÁ A "agendar_turno" EN\s+ESTA MISMA RESPUESTA/i.test(prompt),
+    "volvió la orden incondicional de agendar que contradecía el gating (v26)",
+  );
+});
+
+Deno.test("v27: las descripciones de tools son contrato, sin órdenes que contradigan el prompt", () => {
+  for (const tool of [TOOL_AGENDAR_TURNO, TOOL_CONSULTAR_DISPONIBILIDAD]) {
+    assert(
+      !/CONFIRMÁ con la paciente/i.test(tool.description),
+      `${tool.name}: pedir confirmación contradice "no preguntes ¿confirmo?"`,
+    );
+    assert(
+      !/llamá a 'agendar_turno'/i.test(tool.description),
+      `${tool.name}: no puede mandar a usar una tool que quizás no está expuesta`,
+    );
+  }
+
+  // El campo real de `ResultadoAgendar` es `horariosAlternativos`
+  // (_shared/calendly.ts); v26 lo describía como 'horarios_alternativos'.
+  assert(TOOL_AGENDAR_TURNO.description.includes("'horariosAlternativos'"));
+  assert(!TOOL_AGENDAR_TURNO.description.includes("horarios_alternativos"));
+});
+
+Deno.test("v27: ningún prompt repite el formato JSON que ya garantiza output_config", () => {
+  const prompts = [
+    promptRedactorCompleto(CATALOGO_FALSO),
+    promptJuezCompleto(CATALOGO_FALSO),
+    systemAgenteTurnosEstatico(CATALOGO_FALSO).text,
+    systemReescrituraEstatico(CATALOGO_FALSO).text,
+  ];
+
+  for (const prompt of prompts) {
+    assert(
+      !/Devolvés SIEMPRE un JSON/i.test(prompt),
+      "el formato de salida lo garantiza structured outputs, no el prompt",
+    );
+  }
 });
